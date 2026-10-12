@@ -11,12 +11,14 @@ import (
 type SessionResponse struct {
 	*Session
 	AttentionStatus claude.ClaudeSessionStatus `json:"attention_status,omitempty"`
+	IsBlocked       bool                       `json:"is_blocked"`
 }
 
 func NewSessionResponse(session *Session) *SessionResponse {
 	return &SessionResponse{
 		Session:         session,
 		AttentionStatus: session.AttentionStatus(),
+		IsBlocked:       session.IsBlocked(),
 	}
 }
 
@@ -94,6 +96,19 @@ func (r *AddWorkspaceRequest) Bind(_ *http.Request) error {
 	}
 	if (r.Branch != "") == (r.BaseBranch != "") {
 		return errors.New("exactly one of branch or base_branch is required")
+	}
+	return nil
+}
+
+type AddBlockerRequest struct {
+	Kind BlockerKind `json:"kind"`
+	Note string      `json:"note,omitempty"`
+	URL  string      `json:"url,omitempty"`
+}
+
+func (r *AddBlockerRequest) Bind(_ *http.Request) error {
+	if !r.Kind.Valid() {
+		return fmt.Errorf("kind must be one of review, slack, other (got %q)", r.Kind)
 	}
 	return nil
 }

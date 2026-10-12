@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -45,6 +46,7 @@ type Session struct {
 	SessionActions []SessionAction        `json:"session_actions,omitempty" gorm:"foreignKey:SessionID;constraint:OnDelete:CASCADE"`
 	SetupSteps     []SessionSetupStep     `json:"setup_steps,omitempty" gorm:"foreignKey:SessionID;constraint:OnDelete:CASCADE"`
 	Worktrees      []SessionWorktree      `json:"worktrees,omitempty" gorm:"foreignKey:SessionID;constraint:OnDelete:CASCADE"`
+	Blockers       []SessionBlocker       `json:"blockers,omitempty" gorm:"foreignKey:SessionID;constraint:OnDelete:CASCADE"`
 	TmuxSessionID  *uint                  `json:"tmux_session_id,omitempty" gorm:"uniqueIndex"`
 	StatusError    string                 `json:"status_error,omitempty"`
 	TmuxSession    *utmux.TmuxSession     `json:"tmux_session,omitempty" gorm:"foreignKey:TmuxSessionID"`
@@ -92,6 +94,20 @@ func (s *Session) CanDelete() bool {
 
 func (s *Session) IsMulti() bool {
 	return len(s.Worktrees) > 1
+}
+
+func (s *Session) OpenBlockers() []SessionBlocker {
+	var out []SessionBlocker
+	for _, b := range s.Blockers {
+		if b.IsOpen() {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func (s *Session) IsBlocked() bool {
+	return slices.ContainsFunc(s.Blockers, SessionBlocker.IsOpen)
 }
 
 // IsHidden reports whether the session is normally hidden from the default

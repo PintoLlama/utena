@@ -12,6 +12,7 @@ import (
 	"github.com/eleonorayaya/utena/internal/common"
 	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/session"
+	"github.com/eleonorayaya/utena/internal/tui/blockerform"
 	"github.com/eleonorayaya/utena/internal/tui/provider"
 	"github.com/eleonorayaya/utena/internal/tui/router"
 	"github.com/eleonorayaya/utena/internal/tui/sessiondetail"
@@ -59,8 +60,39 @@ func (m Model) listWidth() int {
 	return min(max(w, 36), 52)
 }
 
+type listGroupKind int
+
+const (
+	groupLive listGroupKind = iota
+	groupBlocked
+	groupHidden
+)
+
+func listGroup(s session.Session) listGroupKind {
+	switch {
+	case s.IsHidden():
+		return groupHidden
+	case s.IsBlocked():
+		return groupBlocked
+	default:
+		return groupLive
+	}
+}
+
+func (m Model) firstBlockedIndex() int {
+	for i, s := range m.filtered {
+		if listGroup(s) == groupBlocked {
+			return i
+		}
+	}
+	return -1
+}
+
 func (m Model) bodyHeight() int {
 	h := m.height - 3
+	if m.firstBlockedIndex() >= 0 {
+		h -= 2
+	}
 	if h < 1 {
 		return 1
 	}
@@ -118,7 +150,7 @@ func (m *Model) rebuildFiltered() {
 		}
 	}
 	sort.SliceStable(m.filtered, func(i, j int) bool {
-		return !m.filtered[i].IsHidden() && m.filtered[j].IsHidden()
+		return listGroup(m.filtered[i]) < listGroup(m.filtered[j])
 	})
 
 	if selectedID != 0 {
@@ -325,6 +357,16 @@ func (m Model) OnKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 			fmt.Sprintf("press a again to archive %s", sessionDisplayName(*sel)))
 		return m, cmd, true
 
+	case key.Matches(msg, keys.Block):
+		sel := m.selectedSession()
+		if sel == nil {
+			return m, nil, false
+		}
+		return m, tea.Sequence(
+			router.NavigateTo(router.BlockerFormView),
+			blockerform.Start(sel.ID),
+		), true
+
 	case key.Matches(msg, keys.Delete):
 		sel := m.selectedSession()
 		if sel == nil {
@@ -370,8 +412,12 @@ func sessionDisplayName(s session.Session) string {
 }
 
 func (m Model) renderRow(s session.Session, selected bool, width int) string {
-	badge := statusview.NewStatusBadge(s.ClaudeSessions, false)
-	badgeStr := badge.View()
+	var badgeStr string
+	if listGroup(s) == groupBlocked {
+		badgeStr = lipgloss.NewStyle().Foreground(theme.Current.TextMuted).Render(" " + blockedTag(s) + " ")
+	} else {
+		badgeStr = statusview.NewStatusBadge(s.ClaudeSessions, false).View()
+	}
 	badgeW := lipgloss.Width(badgeStr)
 
 	var timePart string
@@ -430,13 +476,25 @@ func (m Model) renderRow(s session.Session, selected bool, width int) string {
 	return cursorStr + nameStr + wsStr + timeStr + badgeStr
 }
 
+func blockedTag(s session.Session) string {
+	open := s.OpenBlockers()
+	tag := "⏸ " + string(open[0].Kind)
+	if len(open) > 1 {
+		tag += fmt.Sprintf(" ×%d", len(open))
+	}
+	return tag
+}
+
+func sectionHeader(title string, width int) string {
+	titleStyle := lipgloss.NewStyle().Foreground(theme.Current.Primary).Bold(true)
+	return titleStyle.Render(title) + "\n" +
+		lipgloss.NewStyle().Foreground(theme.Current.SurfaceVariant).Render(strings.Repeat("─", width))
+}
+
 func (m Model) renderList(width int) string {
 	var b strings.Builder
 
-	titleStyle := lipgloss.NewStyle().Foreground(theme.Current.Primary).Bold(true)
-	b.WriteString(titleStyle.Render("Sessions"))
-	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Foreground(theme.Current.SurfaceVariant).Render(strings.Repeat("─", width)))
+	b.WriteString(sectionHeader("Sessions", width))
 	b.WriteString("\n")
 
 	bh := m.bodyHeight()
@@ -448,8 +506,13 @@ func (m Model) renderList(width int) string {
 		visible = nil
 	}
 
+	blockedAt := m.firstBlockedIndex()
 	for i, s := range visible {
 		idx := i + m.offset
+		if idx == blockedAt {
+			b.WriteString(sectionHeader("Blocked", width))
+			b.WriteString("\n")
+		}
 		selected := idx == m.cursor
 		b.WriteString(m.renderRow(s, selected, width))
 		if i < len(visible)-1 {

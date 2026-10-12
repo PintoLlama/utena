@@ -29,6 +29,9 @@ func (s *SessionStore) loaded() *gorm.DB {
 		Preload("SetupSteps", func(db *gorm.DB) *gorm.DB {
 			return db.Order("session_setup_steps.position ASC")
 		}).
+		Preload("Blockers", func(db *gorm.DB) *gorm.DB {
+			return db.Order("session_blockers.created_at ASC")
+		}).
 		Preload("Worktrees", func(db *gorm.DB) *gorm.DB {
 			return db.Order("session_worktrees.position ASC")
 		}).
@@ -267,4 +270,15 @@ func (s *SessionStore) OnAppStart(ctx context.Context) error {
 
 func (s *SessionStore) OnAppEnd(ctx context.Context) error {
 	return nil
+}
+
+func (s *SessionStore) GetStatus(id uint) (SessionStatus, error) {
+	var sess Session
+	if err := s.db.Model(&Session{}).Select("status").First(&sess, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", ErrSessionNotFound
+		}
+		return "", err
+	}
+	return sess.Status, nil
 }

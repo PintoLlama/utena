@@ -25,7 +25,7 @@ type SetupWarning struct{ Message string }
 func (w SetupWarning) Error() string { return w.Message }
 
 const (
-	envSessionID      = "UTENA_SESSION_ID"
+	EnvSessionID      = "UTENA_SESSION_ID"
 	envSessionName    = "UTENA_SESSION_NAME"
 	envSessionRoot    = "UTENA_SESSION_ROOT"
 	envBranch         = "UTENA_BRANCH"
@@ -71,6 +71,7 @@ type SessionService struct {
 	dismissedPRStore     *DismissedPRStore
 	sessionActionStore   *SessionActionStore
 	setupStepStore       *SessionSetupStepStore
+	blockerStore         *SessionBlockerStore
 	workspaceService     *workspace.WorkspaceService
 	gitService           *git.GitService
 	tmuxService          *utmux.TmuxService
@@ -88,6 +89,7 @@ func NewSessionService(store *SessionStore, sessionWorktreeStore *SessionWorktre
 		dismissedPRStore:     dismissedPRStore,
 		sessionActionStore:   sessionActionStore,
 		setupStepStore:       setupStepStore,
+		blockerStore:         NewSessionBlockerStore(store.db),
 		workspaceService:     workspaceService,
 		gitService:           gitService,
 		tmuxService:          tmuxService,
@@ -378,7 +380,7 @@ func (s *SessionService) CreateSession(ctx context.Context, input CreateSessionI
 	}
 
 	tmuxName := SanitizeTmuxName(name)
-	tmuxEnv := map[string]string{envSessionID: fmt.Sprintf("%d", sess.ID)}
+	tmuxEnv := map[string]string{EnvSessionID: fmt.Sprintf("%d", sess.ID)}
 	tmuxRecord, err := s.tmuxService.RegisterPending(tmuxName, sessionRoot, tmuxEnv)
 	if err != nil {
 		if delErr := s.store.Delete(sess.ID); delErr != nil {
@@ -931,7 +933,7 @@ func (s *SessionService) setupTmux(ctx context.Context, sess *Session, tmuxName 
 	if startDir == "" {
 		startDir = sess.SessionRoot
 	}
-	env := map[string]string{envSessionID: fmt.Sprintf("%d", sess.ID)}
+	env := map[string]string{EnvSessionID: fmt.Sprintf("%d", sess.ID)}
 
 	ts, err := tracedOp(ctx, "tmux new-session", func() (*utmux.TmuxSession, error) {
 		return s.tmuxService.CreateSession(tmuxName, startDir, env)
@@ -1730,4 +1732,68 @@ func (s *SessionService) maybeCompleteSession(sess *Session, pr *git.PullRequest
 	} else {
 		slog.Info("marked session completed after PR merge", "session", sess.ID, "pr", pr.Number)
 	}
+}
+
+type AddBlockerInput struct {
+	Kind BlockerKind
+	Note string
+	URL  string
+}
+
+func (s *SessionService) requireLiveSession(id uint) error {
+	status, err := s.store.GetStatus(id)
+	if err != nil {
+		return err
+	}
+	if status == StatusDeleted {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+func (s *SessionService) ownedBlocker(sessionID, blockerID uint) (*SessionBlocker, error) {
+	if err := s.requireLiveSession(sessionID); err != nil {
+		return nil, err
+	}
+	b, err := s.blockerStore.GetByID(blockerID)
+	if err != nil {
+		return nil, err
+	}
+	if b.SessionID != sessionID {
+		return nil, ErrBlockerNotFound
+	}
+	return b, nil
+}
+
+func (s *SessionService) AddBlocker(_ context.Context, sessionID uint, in AddBlockerInput) (*Session, error) {
+	if err := s.requireLiveSession(sessionID); err != nil {
+		return nil, err
+	}
+	b := &SessionBlocker{SessionID: sessionID, Kind: in.Kind, Note: in.Note, URL: in.URL}
+	if err := s.blockerStore.Create(b); err != nil {
+		return nil, fmt.Errorf("failed to add blocker: %w", err)
+	}
+	return s.store.GetByID(sessionID)
+}
+
+func (s *SessionService) ResolveBlocker(_ context.Context, sessionID, blockerID uint) (*Session, error) {
+	b, err := s.ownedBlocker(sessionID, blockerID)
+	if err != nil {
+		return nil, err
+	}
+	if b.IsOpen() {
+		now := time.Now()
+		b.ResolvedAt = &now
+		if err := s.blockerStore.Update(b); err != nil {
+			return nil, fmt.Errorf("failed to resolve blocker: %w", err)
+		}
+	}
+	return s.store.GetByID(sessionID)
+}
+
+func (s *SessionService) DeleteBlocker(_ context.Context, sessionID, blockerID uint) error {
+	if _, err := s.ownedBlocker(sessionID, blockerID); err != nil {
+		return err
+	}
+	return s.blockerStore.Delete(blockerID)
 }
