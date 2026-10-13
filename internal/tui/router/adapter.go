@@ -3,6 +3,7 @@ package router
 import (
 	"github.com/charmbracelet/bubbles/help"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/eleonorayaya/utena/internal/tui/ui"
 )
 
 type ViewEntry interface {
@@ -10,6 +11,8 @@ type ViewEntry interface {
 	Update(tea.Msg) tea.Cmd
 	View() string
 	Keys() help.KeyMap
+	Status() ui.Status
+	CapturesText() bool
 }
 
 type ViewAdapter[T interface {
@@ -39,4 +42,18 @@ func (a *ViewAdapter[T]) View() string {
 
 func (a *ViewAdapter[T]) Keys() help.KeyMap {
 	return a.Model.Keys()
+}
+
+func (a *ViewAdapter[T]) Status() ui.Status {
+	if sr, ok := any(a.Model).(ui.StatusReporter); ok {
+		return sr.Status()
+	}
+	return ui.Status{}
+}
+
+func (a *ViewAdapter[T]) CapturesText() bool {
+	if tc, ok := any(a.Model).(ui.TextCapturer); ok {
+		return tc.CapturesText()
+	}
+	return false
 }
