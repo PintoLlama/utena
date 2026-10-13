@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -406,4 +407,57 @@ func TestGitCLI_CloneBareWorkspace_CleansUpOnCloneFailure(t *testing.T) {
 
 	_, statErr := os.Stat(target)
 	require.True(t, os.IsNotExist(statErr), "failed clone should clean up its target dir, got: %v", statErr)
+}
+
+func TestGitCLI_CreateWorktree_DoesNotRunUtenaHook(t *testing.T) {
+	repo := initTestRepo(t)
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	run(t, repo, "git", "config", "hook.utena.command", "touch "+marker)
+	run(t, repo, "git", "config", "hook.utena.event", "post-checkout")
+
+	svc := newGitCLI()
+	_, err := svc.createWorktree(context.Background(), repo, "eqt/no-hook", "main", "")
+	require.NoError(t, err)
+
+	_, err = os.Stat(marker)
+	require.True(t, os.IsNotExist(err), "daemon git calls must not trigger the utena hook")
+}
+
+func TestGitCLI_HasUnpushedCommits(t *testing.T) {
+	clone, _ := initTestRepoWithOrigin(t)
+	svc := newGitCLI()
+	ctx := context.Background()
+
+	run(t, clone, "git", "branch", "pushed-only")
+	unpushed, err := svc.hasUnpushedCommits(ctx, clone, "pushed-only")
+	require.NoError(t, err)
+	require.False(t, unpushed)
+
+	run(t, clone, "git", "checkout", "-b", "local-work")
+	run(t, clone, "git", "commit", "--allow-empty", "-m", "wip")
+	unpushed, err = svc.hasUnpushedCommits(ctx, clone, "local-work")
+	require.NoError(t, err)
+	require.True(t, unpushed)
+
+	_, err = svc.hasUnpushedCommits(ctx, clone, "does-not-exist")
+	require.Error(t, err)
+}
+
+func TestGitCLI_BranchHead(t *testing.T) {
+	clone, _ := initTestRepoWithOrigin(t)
+	svc := newGitCLI()
+	ctx := context.Background()
+
+	run(t, clone, "git", "checkout", "-b", "head-branch")
+	run(t, clone, "git", "commit", "--allow-empty", "-m", "wip")
+	out, err := exec.Command("git", "-C", clone, "rev-parse", "HEAD").Output()
+	require.NoError(t, err)
+	want := string(bytes.TrimSpace(out))
+
+	got, err := svc.branchHead(ctx, clone, "head-branch")
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	_, err = svc.branchHead(ctx, clone, "does-not-exist")
+	require.Error(t, err)
 }

@@ -7,10 +7,39 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/session"
+	"github.com/eleonorayaya/utena/internal/tui/provider"
+	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
+
+func TestSessionList_PreviewShowsEmbeddedPRsForMultiWorkspaceSession(t *testing.T) {
+	utenaBranch, dotfilesBranch := uint(1), uint(2)
+	sess := session.Session{
+		Model:  gorm.Model{ID: 7},
+		Name:   "multi",
+		Status: session.StatusActive,
+		Worktrees: []session.SessionWorktree{
+			{Worktree: &git.Worktree{BranchID: utenaBranch}, Workspace: &workspace.Workspace{Model: gorm.Model{ID: 10}, Name: "utena"}},
+			{Worktree: &git.Worktree{BranchID: dotfilesBranch}, Workspace: &workspace.Workspace{Model: gorm.Model{ID: 20}, Name: "dotfiles"}},
+		},
+		PullRequests: []git.PullRequest{
+			{Number: 116, Title: "utena pr", HeadBranchID: &utenaBranch, State: git.PRStateDraft},
+			{Number: 96, Title: "dotfiles pr", HeadBranchID: &dotfilesBranch, State: git.PRStateDraft},
+		},
+	}
+
+	m, _ := New().Update(tea.WindowSizeMsg{Width: 200, Height: 40})
+	m, cmd := m.Update(provider.SessionsStateUpdatedMsg{Sessions: []session.Session{sess}})
+	require.Nil(t, cmd)
+
+	out := m.View()
+	assert.Contains(t, out, "#116 utena pr")
+	assert.Contains(t, out, "#96 dotfiles pr")
+}
 
 func msgTypeName(cmd tea.Cmd) string {
 	if cmd == nil {

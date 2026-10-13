@@ -9,6 +9,7 @@ import (
 	"github.com/eleonorayaya/utena/internal/db"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type SessionStore struct {
@@ -36,7 +37,9 @@ func (s *SessionStore) loaded() *gorm.DB {
 			return db.Order("session_worktrees.position ASC")
 		}).
 		Preload("Worktrees.Worktree").
-		Preload("Worktrees.Worktree.Branch")
+		Preload("Worktrees.Worktree.Branch").
+		Preload("Branches").
+		Preload("Branches.Branch")
 }
 
 func (s *SessionStore) enrichWorkspaces(sessions []*Session) error {
@@ -232,16 +235,28 @@ func (s *SessionStore) GetByWorkspaceAndName(workspaceID uint, name string, excl
 }
 
 func (s *SessionStore) GetByBranchID(branchID uint) (*Session, error) {
-	subquery := s.db.
+	viaWorktree := s.db.
 		Model(&SessionWorktree{}).
 		Select("session_worktrees.session_id").
 		Joins("JOIN worktrees ON worktrees.id = session_worktrees.worktree_id").
 		Where("worktrees.branch_id = ?", branchID)
+	viaHistory := s.db.
+		Model(&SessionBranch{}).
+		Select("session_branches.session_id").
+		Where("session_branches.branch_id = ?", branchID)
+
 	var session Session
-	if err := s.loaded().First(&session, "sessions.id IN (?)", subquery).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrSessionNotFound
-		}
+	err := s.loaded().
+		Where("sessions.id IN (?) OR sessions.id IN (?)", viaWorktree, viaHistory).
+		Order(clause.OrderBy{Expression: clause.Expr{
+			SQL:  "sessions.id IN (?) DESC, sessions.status IN ? ASC, sessions.last_used_at DESC, sessions.id ASC",
+			Vars: []any{viaWorktree, unwatchedStatuses},
+		}}).
+		Take(&session).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrSessionNotFound
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err := s.enrichWorkspaces([]*Session{&session}); err != nil {

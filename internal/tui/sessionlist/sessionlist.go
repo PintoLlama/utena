@@ -10,7 +10,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/eleonorayaya/utena/internal/common"
-	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/session"
 	"github.com/eleonorayaya/utena/internal/tui/blockerform"
 	"github.com/eleonorayaya/utena/internal/tui/provider"
@@ -33,8 +32,6 @@ type Model struct {
 	pendingDeleteID  uint
 	pendingRepairID  uint
 	statusMsg        string
-	prs              []git.PullRequest
-	lastPRSessionID  uint
 	width            int
 	height           int
 }
@@ -171,23 +168,6 @@ func (m *Model) rebuildFiltered() {
 	m.clampOffset()
 }
 
-func (m *Model) maybeFetchPRs() tea.Cmd {
-	sel := m.selectedSession()
-	if sel == nil {
-		m.prs = nil
-		return nil
-	}
-	if sel.ID == m.lastPRSessionID {
-		return nil
-	}
-	m.prs = nil
-	if !sel.IsMulti() && len(sel.Worktrees) > 0 && sel.Worktrees[0].Workspace != nil {
-		m.lastPRSessionID = sel.ID
-		return provider.FetchPRs(sel.Worktrees[0].Workspace.ID, "")
-	}
-	return nil
-}
-
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -199,17 +179,6 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		newSel := m.selectedSession()
 		if prevSel == nil || newSel == nil || prevSel.ID != newSel.ID {
 			m.clearPending()
-		}
-		return m, m.maybeFetchPRs()
-	case provider.PRsStateUpdatedMsg:
-		sel := m.selectedSession()
-		if sel != nil && len(sel.Worktrees) > 0 && sel.Worktrees[0].Workspace != nil &&
-			msg.WorkspaceID == sel.Worktrees[0].Workspace.ID {
-			var branch *git.Branch
-			if sel.Worktrees[0].Worktree != nil {
-				branch = sel.Worktrees[0].Worktree.Branch
-			}
-			m.prs = filterPRsByBranch(msg.PullRequests, branch)
 		}
 		return m, nil
 	case provider.ErrMsg:
@@ -265,7 +234,6 @@ func (m Model) OnKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 		}
 		if sel := m.selectedSession(); sel != nil && sel.ID != prevID {
 			m.clearPending()
-			return m, m.maybeFetchPRs(), true
 		}
 		return m, nil, true
 
@@ -276,7 +244,6 @@ func (m Model) OnKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 		}
 		if sel := m.selectedSession(); sel != nil && sel.ID != prevID {
 			m.clearPending()
-			return m, m.maybeFetchPRs(), true
 		}
 		return m, nil, true
 
@@ -386,19 +353,6 @@ func (m Model) OnKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 	}
 
 	return m, nil, false
-}
-
-func filterPRsByBranch(prs []git.PullRequest, branch *git.Branch) []git.PullRequest {
-	if branch == nil {
-		return nil
-	}
-	var out []git.PullRequest
-	for _, pr := range prs {
-		if pr.HeadBranchID != nil && *pr.HeadBranchID == branch.ID {
-			out = append(out, pr)
-		}
-	}
-	return out
 }
 
 func sessionDisplayName(s session.Session) string {
@@ -561,7 +515,7 @@ func (m Model) View() string {
 	divider := strings.Join(divLines, "\n")
 
 	sel := m.selectedSession()
-	panelStr := sessiondetail.RenderPanel(sel, m.prs, panelW, bodyH)
+	panelStr := sessiondetail.RenderPanel(sel, panelW, bodyH)
 
 	body := lipgloss.JoinHorizontal(lipgloss.Top, listStr, divider, panelStr)
 	return body + "\n" + footer

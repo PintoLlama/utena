@@ -227,6 +227,30 @@ func (s *GitService) CurrentBranch(ctx context.Context, repoPath string) (string
 	return s.cli.currentBranch(ctx, repoPath)
 }
 
+func (s *GitService) DefaultBranch(ctx context.Context, repoPath string) string {
+	return s.cli.defaultBranch(ctx, repoPath)
+}
+
+func (s *GitService) HasUnpushedCommits(ctx context.Context, repoPath string, branch string) (bool, error) {
+	return s.cli.hasUnpushedCommits(ctx, repoPath, branch)
+}
+
+func (s *GitService) BranchHead(ctx context.Context, repoPath string, branch string) (string, error) {
+	return s.cli.branchHead(ctx, repoPath, branch)
+}
+
+func (s *GitService) RepointWorktree(wt *Worktree, branch *Branch) error {
+	if wt == nil || branch == nil {
+		return fmt.Errorf("worktree and branch are required")
+	}
+	if err := s.worktreeStore.UpdateBranchID(wt.ID, branch.ID); err != nil {
+		return err
+	}
+	wt.BranchID = branch.ID
+	wt.Branch = branch
+	return nil
+}
+
 func (s *GitService) IsDirty(ctx context.Context, repoPath string) (bool, error) {
 	return s.cli.isDirty(ctx, repoPath)
 }
@@ -477,6 +501,10 @@ func (s *GitService) GetPR(id uint) (*PullRequest, error) {
 
 func (s *GitService) GetPRsForBranch(branchID uint) []PullRequest {
 	return s.prStore.ListByBranch(branchID)
+}
+
+func (s *GitService) GetPRsForBranches(branchIDs []uint) []PullRequest {
+	return s.prStore.ListByBranches(branchIDs)
 }
 
 func (s *GitService) SearchPRs(repoID uint, state PRState) []PullRequest {

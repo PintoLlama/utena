@@ -68,6 +68,7 @@ func tracedOp[T any](ctx context.Context, op string, fn func() (T, error), attrs
 type SessionService struct {
 	store                *SessionStore
 	sessionWorktreeStore *SessionWorktreeStore
+	sessionBranchStore   *SessionBranchStore
 	dismissedPRStore     *DismissedPRStore
 	sessionActionStore   *SessionActionStore
 	setupStepStore       *SessionSetupStepStore
@@ -86,6 +87,7 @@ func NewSessionService(store *SessionStore, sessionWorktreeStore *SessionWorktre
 	return &SessionService{
 		store:                store,
 		sessionWorktreeStore: sessionWorktreeStore,
+		sessionBranchStore:   NewSessionBranchStore(store.db),
 		dismissedPRStore:     dismissedPRStore,
 		sessionActionStore:   sessionActionStore,
 		setupStepStore:       setupStepStore,
@@ -117,6 +119,7 @@ func (s *SessionService) OnAppStart(ctx context.Context) error {
 	s.markLegacyLayoutSessionsBroken(sessions)
 	s.recoverStuckCreatingSessions(sessions)
 	s.reconcileTmuxState(ctx, sessions)
+	s.syncWatchedSessionBranches(ctx, sessions)
 	return nil
 }
 
@@ -188,7 +191,33 @@ func (s *SessionService) ListSessions(ctx context.Context) ([]Session, error) {
 	for i := range sessions {
 		s.populateTmuxWindows(ctx, &sessions[i])
 	}
+	s.attachPullRequests(sessions)
 	return sessions, nil
+}
+
+func (s *SessionService) attachPullRequests(sessions []Session) {
+	var branchIDs []uint
+	for i := range sessions {
+		branchIDs = append(branchIDs, sessions[i].BranchIDs()...)
+	}
+	byBranch := groupPRsByBranch(s.gitService.GetPRsForBranches(branchIDs))
+	for i := range sessions {
+		var prs []git.PullRequest
+		for _, id := range sessions[i].BranchIDs() {
+			prs = append(prs, byBranch[id]...)
+		}
+		sessions[i].PullRequests = prs
+	}
+}
+
+func groupPRsByBranch(prs []git.PullRequest) map[uint][]git.PullRequest {
+	byBranch := make(map[uint][]git.PullRequest)
+	for _, pr := range prs {
+		if pr.HeadBranchID != nil {
+			byBranch[*pr.HeadBranchID] = append(byBranch[*pr.HeadBranchID], pr)
+		}
+	}
+	return byBranch
 }
 
 func (s *SessionService) ListSessionsByWorkspace(ctx context.Context, workspaceID uint) ([]Session, error) {
@@ -203,6 +232,7 @@ func (s *SessionService) ListSessionsByWorkspace(ctx context.Context, workspaceI
 	for i := range sessions {
 		s.populateTmuxWindows(ctx, &sessions[i])
 	}
+	s.attachPullRequests(sessions)
 	return sessions, nil
 }
 
@@ -212,6 +242,7 @@ func (s *SessionService) GetSession(ctx context.Context, id uint) (*Session, err
 		return nil, err
 	}
 	s.populateTmuxWindows(ctx, sess)
+	sess.PullRequests = s.gitService.GetPRsForBranches(sess.BranchIDs())
 	return sess, nil
 }
 
@@ -1056,6 +1087,7 @@ func (s *SessionService) ActivateSession(ctx context.Context, id uint) (*Session
 	}
 
 	s.ensureSessionWorktrees(ctx, session)
+	s.SyncSessionBranches(ctx, session)
 
 	tmuxName := SanitizeTmuxName(session.Name)
 	if session.TmuxSessionID != nil && session.TmuxSession != nil && session.TmuxSession.Name != "" {
@@ -1150,6 +1182,13 @@ func (s *SessionService) DeleteSession(ctx context.Context, id uint, deleteBranc
 		}
 	}
 
+	if deleteBranch {
+		s.SyncSessionBranches(ctx, session)
+		if refreshed, err := s.store.GetByID(id); err == nil {
+			session = refreshed
+		}
+	}
+
 	s.cleanupSessionResources(ctx, session, deleteBranch)
 
 	if err := s.store.HardDelete(id); err != nil {
@@ -1203,7 +1242,67 @@ func (s *SessionService) cleanupSessionResources(ctx context.Context, session *S
 		}
 	}
 
+	if deleteBranch {
+		s.cleanupPastBranches(ctx, session, wsCache)
+	}
+
 	s.removeSessionRoot(session)
+}
+
+func (s *SessionService) cleanupPastBranches(ctx context.Context, session *Session, wsCache map[uint]*workspace.Workspace) {
+	defaultMatchers := make(map[uint]func(string) bool)
+	for _, branch := range session.PastBranches() {
+		ws, ok := wsCache[branch.RepoID]
+		if !ok {
+			found, err := s.workspaceService.GetWorkspaceByRepoID(ctx, branch.RepoID)
+			if err != nil {
+				slog.Warn("cleanup: failed to resolve workspace for past branch", "branch", branch.Name, "error", err)
+				continue
+			}
+			ws = found
+			wsCache[branch.RepoID] = ws
+		}
+		isDefault, ok := defaultMatchers[branch.RepoID]
+		if !ok {
+			isDefault = s.defaultBranchMatcher(ctx, ws.Path)
+			defaultMatchers[branch.RepoID] = isDefault
+		}
+		if isDefault(branch.Name) {
+			continue
+		}
+		exists, err := s.gitService.HasBranch(ctx, ws.Path, branch.Name)
+		if err != nil || !exists {
+			continue
+		}
+		if !s.pastBranchDeletable(ctx, &branch, ws.Path) {
+			slog.Warn("keeping past session branch with unpushed work", "session", session.ID, "branch", branch.Name)
+			continue
+		}
+		if err := s.gitService.CleanupBranch(ctx, &branch, ws.Path, true); err != nil {
+			slog.Warn("failed to delete past session branch", "session", session.ID, "branch", branch.Name, "error", err)
+		}
+	}
+}
+
+func (s *SessionService) pastBranchDeletable(ctx context.Context, branch *git.Branch, repoPath string) bool {
+	head := ""
+	for _, pr := range s.gitService.GetPRsForBranch(branch.ID) {
+		if pr.State != git.PRStateMerged || pr.HeadSHA == "" {
+			continue
+		}
+		if head == "" {
+			resolved, err := s.gitService.BranchHead(ctx, repoPath, branch.Name)
+			if err != nil {
+				break
+			}
+			head = resolved
+		}
+		if head == pr.HeadSHA {
+			return true
+		}
+	}
+	unpushed, err := s.gitService.HasUnpushedCommits(ctx, repoPath, branch.Name)
+	return err == nil && !unpushed
 }
 
 // removeSessionRoot deletes the session's container directory, but only when it
@@ -1396,15 +1495,12 @@ func (s *SessionService) DismissSession(ctx context.Context, id uint) error {
 	}
 
 	if s.dismissedPRStore != nil {
-		branchIDs := s.sessionBranchIDs(sess)
-		for _, branchID := range branchIDs {
-			for _, pr := range s.gitService.GetPRsForBranch(branchID) {
-				if err := s.dismissedPRStore.Add(&DismissedPR{
-					PullRequestID: pr.ID,
-					DismissedAt:   time.Now(),
-				}); err != nil {
-					slog.Warn("failed to record dismissed PR", "pr", pr.ID, "error", err)
-				}
+		for _, pr := range s.gitService.GetPRsForBranches(sess.BranchIDs()) {
+			if err := s.dismissedPRStore.Add(&DismissedPR{
+				PullRequestID: pr.ID,
+				DismissedAt:   time.Now(),
+			}); err != nil {
+				slog.Warn("failed to record dismissed PR", "pr", pr.ID, "error", err)
 			}
 		}
 	}
@@ -1461,18 +1557,6 @@ func (s *SessionService) reconcileLoadedSession(ctx context.Context, sess *Sessi
 		return nil, fmt.Errorf("failed to persist reconciled session: %w", err)
 	}
 	return sess, nil
-}
-
-func (s *SessionService) sessionBranchIDs(sess *Session) []uint {
-	out := make([]uint, 0, len(sess.Worktrees))
-	for i := range sess.Worktrees {
-		wt := sess.Worktrees[i].Worktree
-		if wt == nil || wt.BranchID == 0 {
-			continue
-		}
-		out = append(out, wt.BranchID)
-	}
-	return out
 }
 
 func (s *SessionService) ensureSessionWorktrees(ctx context.Context, sess *Session) {
@@ -1561,7 +1645,6 @@ func (s *SessionService) handlePRUpdated(ctx context.Context, event eventbus.Eve
 
 	isNew := data.Previous == nil
 	newlyAssigned := pr.IsAssignedToMe && pr.State == git.PRStateOpen && (isNew || !data.Previous.IsAssignedToMe)
-	newlyMerged := pr.State == git.PRStateMerged && (isNew || data.Previous.State != git.PRStateMerged)
 
 	sess, _ := s.store.GetByBranchID(*pr.HeadBranchID)
 
@@ -1573,17 +1656,13 @@ func (s *SessionService) handlePRUpdated(ctx context.Context, event eventbus.Eve
 		return nil
 	}
 
-	if newlyMerged {
-		s.maybeCompleteSession(sess, pr)
-	}
-
 	s.notifyPRUpdated(ctx, sess, pr, data.Previous)
 
 	return nil
 }
 
 func (s *SessionService) notifyPRUpdated(ctx context.Context, sess *Session, pr *git.PullRequest, previous *git.PullRequest) {
-	data := git.NewPRNotification(pr, previous, sessionBranchName(sess, *pr.HeadBranchID))
+	data := git.NewPRNotification(pr, previous, sess.branchName(*pr.HeadBranchID))
 	s.publishNotification(ctx, sess.ID, git.NotificationPullRequest, data)
 }
 
@@ -1593,19 +1672,21 @@ func (s *SessionService) SessionSnapshot(ctx context.Context, sessionID uint) []
 		return nil
 	}
 
+	return openPRNotifications(sessionID, s.gitService.GetPRsForBranches(sess.BranchIDs()), sess.branchName)
+}
+
+func openPRNotifications(sessionID uint, prs []git.PullRequest, branchName func(uint) string) []eventbus.SessionNotificationEvent {
 	var out []eventbus.SessionNotificationEvent
-	for _, branchID := range s.sessionBranchIDs(sess) {
-		branch := sessionBranchName(sess, branchID)
-		for _, pr := range s.gitService.GetPRsForBranch(branchID) {
-			if !pr.State.IsOpen() {
-				continue
-			}
-			out = append(out, eventbus.SessionNotificationEvent{
-				SessionID: sessionID,
-				Type:      git.NotificationPullRequest,
-				Data:      git.NewPRNotification(&pr, nil, branch),
-			})
+	for i := range prs {
+		pr := &prs[i]
+		if !pr.State.IsOpen() || pr.HeadBranchID == nil {
+			continue
 		}
+		out = append(out, eventbus.SessionNotificationEvent{
+			SessionID: sessionID,
+			Type:      git.NotificationPullRequest,
+			Data:      git.NewPRNotification(pr, nil, branchName(*pr.HeadBranchID)),
+		})
 	}
 	return out
 }
@@ -1628,7 +1709,7 @@ func (s *SessionService) SyncPRActivity(ctx context.Context) error {
 		if !sess.watchesPRActivity() {
 			continue
 		}
-		for _, branchID := range s.sessionBranchIDs(sess) {
+		for _, branchID := range sess.BranchIDs() {
 			if _, seen := watchers[branchID]; !seen {
 				order = append(order, branchID)
 			}
@@ -1636,8 +1717,9 @@ func (s *SessionService) SyncPRActivity(ctx context.Context) error {
 		}
 	}
 
+	byBranch := groupPRsByBranch(s.gitService.GetPRsForBranches(order))
 	for _, branchID := range order {
-		for _, pr := range s.gitService.GetPRsForBranch(branchID) {
+		for _, pr := range byBranch[branchID] {
 			if !pr.State.IsOpen() {
 				continue
 			}
@@ -1671,16 +1753,6 @@ func (s *SessionService) publishNotification(ctx context.Context, sessionID uint
 	if err := s.eventBus.Publish(ctx, event); err != nil {
 		slog.Warn("failed to publish session notification", "session", sessionID, "type", notificationType, "error", err)
 	}
-}
-
-func sessionBranchName(sess *Session, branchID uint) string {
-	for i := range sess.Worktrees {
-		wt := sess.Worktrees[i].Worktree
-		if wt != nil && wt.BranchID == branchID && wt.Branch != nil {
-			return wt.Branch.Name
-		}
-	}
-	return ""
 }
 
 func (s *SessionService) maybeCreatePendingSession(ctx context.Context, data git.PRUpdatedEvent) {
@@ -1719,19 +1791,6 @@ func (s *SessionService) maybeCreatePendingSession(ctx context.Context, data git
 	}
 
 	slog.Info("activating session for assigned PR", "pr", pr.Number, "session", sess.ID, "branch", branch.Name)
-}
-
-func (s *SessionService) maybeCompleteSession(sess *Session, pr *git.PullRequest) {
-	if sess.Status == StatusDeleted || sess.Status == StatusArchived || sess.Status == StatusCompleted {
-		return
-	}
-
-	sess.Status = StatusCompleted
-	if err := s.store.Update(sess); err != nil {
-		slog.Warn("failed to mark session completed", "session", sess.ID, "error", err)
-	} else {
-		slog.Info("marked session completed after PR merge", "session", sess.ID, "pr", pr.Number)
-	}
 }
 
 type AddBlockerInput struct {

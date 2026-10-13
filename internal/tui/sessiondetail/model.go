@@ -83,7 +83,6 @@ func prStateColor(state git.PRState) lipgloss.Color {
 
 type Model struct {
 	sess                   *session.Session
-	prs                    []git.PullRequest
 	pendingDeleteID        uint
 	interactive            bool
 	blockerCursor          int
@@ -135,19 +134,10 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	case SelectMsg:
 		s := msg.Session
 		m.sess = &s
-		m.prs = nil
 		m.pendingDeleteID = 0
 		m.interactive = true
 		m.blockerCursor = 0
 		m.pendingBlockerDeleteID = 0
-		if len(s.Worktrees) > 0 && s.Worktrees[0].Workspace != nil {
-			return m, provider.FetchPRs(s.Worktrees[0].Workspace.ID, "")
-		}
-		return m, nil
-	case provider.PRsStateUpdatedMsg:
-		if m.sess != nil && len(m.sess.Worktrees) > 0 && m.sess.Worktrees[0].Workspace != nil && msg.WorkspaceID == m.sess.Worktrees[0].Workspace.ID {
-			m.prs = filterPRsByBranch(msg.PullRequests, m.sess.Worktrees[0].Worktree.Branch)
-		}
 		return m, nil
 	case provider.SessionsStateUpdatedMsg:
 		if m.sess == nil {
@@ -276,24 +266,11 @@ func (m Model) onKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-func filterPRsByBranch(prs []git.PullRequest, branch *git.Branch) []git.PullRequest {
-	if branch == nil {
-		return nil
-	}
-	var out []git.PullRequest
-	for _, pr := range prs {
-		if pr.HeadBranchID != nil && *pr.HeadBranchID == branch.ID {
-			out = append(out, pr)
-		}
-	}
-	return out
-}
-
-func RenderPanel(s *session.Session, prs []git.PullRequest, width, height int) string {
+func RenderPanel(s *session.Session, width, height int) string {
 	if s == nil {
 		return ""
 	}
-	m := Model{sess: s, prs: prs, width: width, height: height}
+	m := Model{sess: s, width: width, height: height}
 	return m.View()
 }
 
@@ -347,6 +324,10 @@ func (m Model) View() string {
 				b.WriteString(labelStyle().Render(label) + lipgloss.NewStyle().Foreground(theme.Current.TextMuted).Render("—") + "\n")
 			}
 		}
+		mutedStyle := lipgloss.NewStyle().Foreground(theme.Current.TextMuted)
+		for _, past := range s.PastBranches() {
+			b.WriteString(labelStyle().Render("Past") + mutedStyle.Render(past.Name) + "\n")
+		}
 	} else {
 		b.WriteString(labelStyle().Render("") + valueStyle().Render(s.WorkspaceDisplay()) + "\n")
 	}
@@ -354,7 +335,7 @@ func (m Model) View() string {
 		pathStyle := lipgloss.NewStyle().Foreground(theme.Current.Path)
 		b.WriteString(labelStyle().Render("Root") + pathStyle.Render(s.SessionRoot) + "\n")
 	}
-	for _, pr := range m.prs {
+	for _, pr := range s.PullRequests {
 		stateStyle := lipgloss.NewStyle().Foreground(prStateColor(pr.State))
 		prStr := fmt.Sprintf("#%d %s ", pr.Number, pr.Title) + stateStyle.Render("["+string(pr.State)+"]")
 		b.WriteString(labelStyle().Render("PR") + prStr + "\n")

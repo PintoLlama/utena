@@ -64,7 +64,7 @@ func (m *SessionModule) OnAppEnd(ctx context.Context) error {
 }
 
 func (m *SessionModule) Models() []any {
-	return []any{&Session{}, &SessionWorktree{}, &DismissedPR{}, &SessionAction{}, &SessionSetupStep{}, &SessionBlocker{}}
+	return []any{&Session{}, &SessionWorktree{}, &SessionBranch{}, &DismissedPR{}, &SessionAction{}, &SessionSetupStep{}, &SessionBlocker{}}
 }
 
 func (m *SessionModule) Routes() chi.Router {
@@ -126,7 +126,18 @@ func (t *prActivityTask) Run(ctx context.Context) error {
 	return t.service.SyncPRActivity(ctx)
 }
 
+type sessionBranchesTask struct {
+	service *SessionService
+}
+
+func (t *sessionBranchesTask) Name() string            { return "session.branches" }
+func (t *sessionBranchesTask) Interval() time.Duration { return 2 * time.Minute }
+func (t *sessionBranchesTask) Run(ctx context.Context) error {
+	return t.service.SyncAllSessionBranches(ctx)
+}
+
 func (m *SessionModule) RegisterJobs(svc *jobs.JobService) {
 	svc.Register(&reconcileSyncTask{service: m.Service})
 	svc.Register(&prActivityTask{service: m.Service})
+	svc.Register(&sessionBranchesTask{service: m.Service})
 }
