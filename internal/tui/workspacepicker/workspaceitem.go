@@ -1,79 +1,61 @@
 package workspacepicker
 
 import (
-	"fmt"
-	"io"
-	"os"
-	"strings"
-
-	"github.com/charmbracelet/bubbles/list"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/eleonorayaya/utena/internal/tui/theme"
+	"github.com/eleonorayaya/utena/internal/tui/ui"
 	"github.com/eleonorayaya/utena/internal/workspace"
 )
 
+const (
+	checkColW = 4
+	KindColW  = 13
+	AgoColW   = 4
+)
+
+func KindSpan(ws workspace.Workspace) ui.Span {
+	switch ws.Status {
+	case workspace.StatusCloning:
+		return ui.Span{Text: "◌ cloning…", Style: ui.FG(theme.Current.StatusActive)}
+	case workspace.StatusMigrating:
+		return ui.Span{Text: "◌ migrating…", Style: ui.FG(theme.Current.StatusActive)}
+	case workspace.StatusFailed:
+		return ui.Span{Text: "✕ failed", Style: ui.FG(theme.Current.Error)}
+	}
+	muted := ui.FG(theme.Current.TextMuted)
+	switch {
+	case !ws.IsGitRepo:
+		return ui.Span{Text: "not git", Style: muted}
+	case ws.IsBare:
+		return ui.Span{Text: "bare", Style: muted}
+	default:
+		return ui.Span{Text: "not bare", Style: muted}
+	}
+}
+
+func AgoSpan(ws workspace.Workspace) ui.Span {
+	return ui.Span{Text: ui.ShortAgo(ws.LastUsedAt), Style: ui.FG(theme.Current.TextMuted)}
+}
+
 type workspaceItem struct {
 	workspace workspace.Workspace
-	selected  bool
+	multi     bool
+	checked   bool
 }
 
-func (i workspaceItem) Title() string       { return i.workspace.Name }
-func (i workspaceItem) Description() string { return AbbreviatePath(i.workspace.Path) }
 func (i workspaceItem) FilterValue() string { return i.workspace.Name }
 
-func AbbreviatePath(path string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return path
+func (i workspaceItem) Cells(selected bool) []ui.Cell {
+	var cells []ui.Cell
+	if i.multi {
+		box := ui.Span{Text: "[ ]", Style: ui.FG(theme.Current.TextMuted)}
+		if i.checked {
+			box = ui.Span{Text: "[x]", Style: ui.FG(theme.Current.Primary)}
+		}
+		cells = append(cells, ui.Cell{Spans: []ui.Span{box}, Width: checkColW})
 	}
-	if strings.HasPrefix(path, home) {
-		return "~" + path[len(home):]
-	}
-	return path
-}
-
-type compactPickerDelegate struct{}
-
-func (d compactPickerDelegate) Height() int                             { return 1 }
-func (d compactPickerDelegate) Spacing() int                            { return 0 }
-func (d compactPickerDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
-
-func (d compactPickerDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
-	i, ok := item.(workspaceItem)
-	if !ok {
-		return
-	}
-
-	focused := m.Index() == index
-
-	cursor := "  "
-	if focused {
-		cursor = lipgloss.NewStyle().Foreground(theme.Current.Primary).Bold(true).Render("› ")
-	}
-
-	checkStyle := lipgloss.NewStyle().Foreground(theme.Current.AccentMint).Bold(true)
-	var check string
-	if i.selected {
-		check = checkStyle.Render("✓ ")
-	} else {
-		check = "  "
-	}
-
-	name := i.workspace.Name
-	if i.workspace.IsHidden {
-		name += " [hidden]"
-	}
-
-	var nameStyle lipgloss.Style
-	if focused {
-		nameStyle = lipgloss.NewStyle().Foreground(theme.Current.TextEmphasis).Bold(true)
-	} else {
-		nameStyle = lipgloss.NewStyle().Foreground(theme.Current.Text)
-	}
-
-	path := AbbreviatePath(i.workspace.Path)
-	pathStyle := lipgloss.NewStyle().Foreground(theme.Current.TextMuted)
-
-	fmt.Fprint(w, cursor+check+nameStyle.Render(name)+"  "+pathStyle.Render(path))
+	return append(cells,
+		ui.Cell{Spans: []ui.Span{{Text: i.workspace.Name, Style: ui.NameStyle(selected)}}},
+		ui.Cell{Spans: []ui.Span{KindSpan(i.workspace)}, Width: KindColW},
+		ui.Cell{Spans: []ui.Span{AgoSpan(i.workspace)}, Width: AgoColW, Align: ui.AlignRight},
+	)
 }
