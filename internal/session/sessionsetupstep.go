@@ -22,8 +22,10 @@ const (
 	StepKindCopyFile         SetupStepKind = "copy_file"
 	StepKindInstallDeps      SetupStepKind = "install_deps"
 	StepKindApplyClaude      SetupStepKind = "apply_claude"
-	StepKindSetupTmux        SetupStepKind = "setup_tmux"
+	StepKindSetupMux         SetupStepKind = "setup_mux"
 )
+
+const setupMuxLabel = "Setup terminal session"
 
 type SessionSetupStep struct {
 	gorm.Model

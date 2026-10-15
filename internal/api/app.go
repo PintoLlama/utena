@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 
@@ -12,8 +13,9 @@ import (
 	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/jobs"
 	"github.com/eleonorayaya/utena/internal/monitor"
+	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/session"
-	"github.com/eleonorayaya/utena/internal/tmux"
+	"github.com/eleonorayaya/utena/internal/tuios"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/go-chi/chi/v5"
 	"github.com/spf13/afero"
@@ -25,7 +27,7 @@ type App struct {
 	Git       *git.GitModule
 	Workspace *workspace.WorkspaceModule
 	Session   *session.SessionModule
-	Tmux      *tmux.TmuxModule
+	Mux       *mux.Module
 	Claude    *claude.ClaudeModule
 	Jobs      *jobs.JobsModule
 	Monitor   *monitor.MonitorModule
@@ -43,7 +45,7 @@ func newApp(gormDB *gorm.DB, fs afero.Fs, cfg Config) *App {
 	return buildApp(gormDB, fs, cfg, nil, nil, nil)
 }
 
-func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, tmuxModule *tmux.TmuxModule, gitMod *git.GitModule, bus eventbus.EventBus) *App {
+func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, muxModule *mux.Module, gitMod *git.GitModule, bus eventbus.EventBus) *App {
 	if bus == nil {
 		bus = eventbus.NewEventBus()
 	}
@@ -56,10 +58,10 @@ func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, tmuxModule *tmux.TmuxMod
 		gitModule = git.NewGitModule(database, bus)
 	}
 	workspaceModule := workspace.NewWorkspaceModule(database, fs, cfg.ConfigDir, gitModule.Service)
-	if tmuxModule == nil {
-		tmuxModule = tmux.NewTmuxModule(bus, database)
+	if muxModule == nil {
+		muxModule = mux.NewModule(tuios.NewDriver(), bus, database)
 	}
-	sessionModule := session.NewSessionModule(tmuxModule.Service, workspaceModule, bus, database, cfg.BranchPrefix, cfg.ConfigDir, cfg.SessionsRoot)
+	sessionModule := session.NewSessionModule(muxModule.Service, workspaceModule, bus, database, cfg.BranchPrefix, cfg.ConfigDir, cfg.SessionsRoot)
 
 	jobsModule := jobs.NewJobsModule()
 	gitModule.RegisterJobs(jobsModule.Service)
@@ -71,13 +73,14 @@ func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, tmuxModule *tmux.TmuxMod
 		Git:       gitModule,
 		Workspace: workspaceModule,
 		Session:   sessionModule,
-		Tmux:      tmuxModule,
+		Mux:       muxModule,
 		Claude:    claude.NewClaudeModule(database),
 		Jobs:      jobsModule,
 		Monitor:   monitor.NewMonitorModule(bus, sessionModule.Service),
 	}
 
 	database.RegisterModels(app.collectModels()...)
+	database.RegisterPreMigrations(app.collectPreMigrations()...)
 
 	return app
 }
@@ -141,10 +144,27 @@ func (a *App) collectModels() []any {
 	return models
 }
 
+func (a *App) collectPreMigrations() []db.PreMigration {
+	var fns []db.PreMigration
+	for _, m := range a.modules() {
+		if pp, ok := m.module.(common.PreMigrationProvider); ok {
+			for _, fn := range pp.PreMigrations() {
+				fns = append(fns, func(tx *gorm.DB) error {
+					if err := fn(tx); err != nil {
+						return fmt.Errorf("%s: %w", m.name, err)
+					}
+					return nil
+				})
+			}
+		}
+	}
+	return fns
+}
+
 func (a *App) modules() []moduleEntry {
 	return []moduleEntry{
 		{"git", "/git", a.Git},
-		{"tmux", "/tmux", a.Tmux},
+		{"mux", "/mux", a.Mux},
 		{"workspace", "/workspaces", a.Workspace},
 		{"claude", "/claude", a.Claude},
 		{"session", "/sessions", a.Session},

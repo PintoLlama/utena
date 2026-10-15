@@ -15,7 +15,7 @@ import (
 	"github.com/eleonorayaya/utena/internal/db/testdb"
 	"github.com/eleonorayaya/utena/internal/eventbus"
 	"github.com/eleonorayaya/utena/internal/git"
-	utmux "github.com/eleonorayaya/utena/internal/tmux"
+	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
@@ -60,7 +60,7 @@ func setupPRTestEnv(t *testing.T, gitOpts ...git.GitServiceOption) *prTestEnv {
 		&git.Branch{},
 		&git.Worktree{},
 		&git.PullRequest{},
-		&utmux.TmuxSession{},
+		&mux.Session{},
 		&Session{},
 		&SessionWorktree{},
 		&SessionBranch{},
@@ -99,11 +99,11 @@ func setupPRTestEnv(t *testing.T, gitOpts ...git.GitServiceOption) *prTestEnv {
 	branch := &git.Branch{Name: branchName, RepoID: repo.ID, ExistsLocal: false, ExistsRemote: true}
 	require.NoError(t, database.Create(branch).Error)
 
-	mock := utmux.NewMockRunner()
-	tmuxService := createTmuxService(t, database, mock, bus)
+	mock := mux.NewFakeDriver()
+	muxService := createMuxService(t, database, mock, bus)
 	sessionActionStore := NewSessionActionStore(database)
 	sessionWorktreeStore := NewSessionWorktreeStore(database)
-	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, tmuxService, bus, "eqt/", t.TempDir(), t.TempDir())
+	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, muxService, bus, "eqt/", t.TempDir(), t.TempDir())
 
 	return &prTestEnv{
 		service:          service,
@@ -512,13 +512,13 @@ func TestHandlePRUpdated_BareWorkspace_CreatesWorktree(t *testing.T) {
 	branch := &git.Branch{Name: branchName, RepoID: repo.ID, ExistsRemote: true}
 	require.NoError(t, database.Create(branch).Error)
 
-	mock := utmux.NewMockRunner()
-	tmuxService := createTmuxService(t, database, mock, bus)
+	mock := mux.NewFakeDriver()
+	muxService := createMuxService(t, database, mock, bus)
 	workspaceService := workspace.NewWorkspaceService(workspaceStore, gitService)
 	dismissedPRStore := NewDismissedPRStore(database)
 	sessionActionStore := NewSessionActionStore(database)
 	sessionWorktreeStore := NewSessionWorktreeStore(database)
-	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, tmuxService, bus, "eqt/", t.TempDir(), t.TempDir())
+	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, muxService, bus, "eqt/", t.TempDir(), t.TempDir())
 
 	branchID := branch.ID
 	event := eventbus.Event{
@@ -553,11 +553,11 @@ func TestHandlePRUpdated_BareWorkspace_CreatesWorktree(t *testing.T) {
 	require.NoError(t, err, "worktree should be created at %s", expectedWorktree)
 	require.True(t, info.IsDir())
 
-	tmuxName := SanitizeTmuxName(sess.Name)
-	require.True(t, mock.HasSessionByName(tmuxName), "tmux session %s should exist", tmuxName)
-	ts, err := tmuxService.GetSessionByName(tmuxName)
+	muxName := SanitizeMuxName(sess.Name)
+	require.True(t, mock.HasSession(muxName), "mux session %s should exist", muxName)
+	ts, err := muxService.GetSessionByName(muxName)
 	require.NoError(t, err)
-	require.Equal(t, filepath.Join(service.sessionsRoot, sess.Name), ts.StartDir, "tmux session should start at the session root")
+	require.Equal(t, filepath.Join(service.sessionsRoot, sess.Name), ts.StartDir, "mux session should start at the session root")
 }
 
 func TestHandlePRUpdated_NewAssignedPR_CreatesSessionAction(t *testing.T) {

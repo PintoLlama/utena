@@ -16,8 +16,8 @@ import (
 	"github.com/eleonorayaya/utena/internal/db"
 	"github.com/eleonorayaya/utena/internal/eventbus"
 	"github.com/eleonorayaya/utena/internal/git"
+	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/session"
-	"github.com/eleonorayaya/utena/internal/tmux"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/go-chi/chi/v5"
 	"github.com/spf13/afero"
@@ -60,7 +60,13 @@ func initApiTestRepo(t *testing.T) string {
 	return dir
 }
 
-func setupTestRouter(t *testing.T) (*App, chi.Router, *tmux.MockRunner, uint, uint) {
+func setupTestRouter(t *testing.T) (*App, chi.Router, *mux.FakeDriver, uint, uint) {
+	t.Helper()
+	app, router, mock, ws1ID, ws2ID, _ := setupTestRouterWithBus(t)
+	return app, router, mock, ws1ID, ws2ID
+}
+
+func setupTestRouterWithBus(t *testing.T) (*App, chi.Router, *mux.FakeDriver, uint, uint, eventbus.EventBus) {
 	t.Helper()
 
 	gormDB, err := db.OpenInMemorySQLite()
@@ -69,11 +75,10 @@ func setupTestRouter(t *testing.T) (*App, chi.Router, *tmux.MockRunner, uint, ui
 	cfg := Config{ConfigDir: "/config", SessionsRoot: t.TempDir()}
 	bus := eventbus.NewEventBus()
 	database := db.NewDB(gormDB)
-	mock := tmux.NewMockRunner()
-	tmuxStore := tmux.NewTmuxStore(database)
-	tmuxModule := tmux.NewTmuxModuleWithRunner(mock, tmuxStore, bus)
+	mock := mux.NewFakeDriver()
+	muxModule := mux.NewModule(mock, bus, database)
 	gitModule := git.NewGitModule(database, bus)
-	app := buildApp(gormDB, afero.NewMemMapFs(), cfg, tmuxModule, gitModule, bus)
+	app := buildApp(gormDB, afero.NewMemMapFs(), cfg, muxModule, gitModule, bus)
 
 	err = app.OnStart(context.Background())
 	require.NoError(t, err)
@@ -93,7 +98,7 @@ func setupTestRouter(t *testing.T) (*App, chi.Router, *tmux.MockRunner, uint, ui
 
 	server := BuildServer(app, cfg)
 
-	return app, server.Handler.(*chi.Mux), mock, ws1.ID, ws2.ID
+	return app, server.Handler.(*chi.Mux), mock, ws1.ID, ws2.ID, bus
 }
 
 func waitForSessionStatus(t *testing.T, router chi.Router, id uint, status session.SessionStatus, timeout time.Duration) {
@@ -189,13 +194,13 @@ func TestDaemon_CreateAndGetSession(t *testing.T) {
 	var response session.SessionResponse
 	err := json.Unmarshal(w.Body.Bytes(), &response)
 	require.NoError(t, err)
-	require.NotNil(t, response.TmuxSessionID)
+	require.NotNil(t, response.MuxSessionID)
 	require.Equal(t, session.StatusActive, response.Status)
 }
 
-func TestDaemon_CreateSession_TmuxFails(t *testing.T) {
+func TestDaemon_CreateSession_MuxFails(t *testing.T) {
 	_, router, mock, ws1ID, _ := setupTestRouter(t)
-	mock.SetCreateErr(fmt.Errorf("tmux server not running"))
+	mock.SetCreateErr(fmt.Errorf("mux server not running"))
 
 	body := fmt.Sprintf(`{"name":"fail-session","workspaces":[{"workspace_id":%d,"base_branch":"main"}]}`, ws1ID)
 	createResp := createSessionViaAPI(t, router, body)
@@ -210,7 +215,7 @@ func TestDaemon_CreateSession_TmuxFails(t *testing.T) {
 	err := json.Unmarshal(w.Body.Bytes(), &response)
 	require.NoError(t, err)
 	require.Equal(t, session.StatusBroken, response.Status)
-	require.Contains(t, response.StatusError, "tmux")
+	require.Contains(t, response.StatusError, "mux")
 }
 
 func TestDaemon_ListSessions(t *testing.T) {
@@ -253,7 +258,7 @@ func TestDaemon_TuiosSessionCreated(t *testing.T) {
 
 	waitForSessionStatus(t, router, createResp.ID, session.StatusActive, 5*time.Second)
 
-	require.NoError(t, app.Tmux.Service.HandleSessionCreated(context.Background(), "test-session"))
+	require.NoError(t, app.Mux.Service.HandleSessionCreated(context.Background(), "test-session"))
 
 	req := httptest.NewRequest("GET", "/sessions", nil)
 	w := httptest.NewRecorder()
@@ -264,14 +269,14 @@ func TestDaemon_TuiosSessionCreated(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, sessionsResponse.Sessions, 1)
 
-	sess := findSessionByTmuxName(sessionsResponse.Sessions, "test-session")
+	sess := findSessionByMuxName(sessionsResponse.Sessions, "test-session")
 	require.NotNil(t, sess)
 	require.Equal(t, session.StatusActive, sess.Status)
 }
 
-func findSessionByTmuxName(sessions []*session.SessionResponse, tmuxName string) *session.SessionResponse {
+func findSessionByMuxName(sessions []*session.SessionResponse, muxName string) *session.SessionResponse {
 	for _, s := range sessions {
-		if s.TmuxSession != nil && s.TmuxSession.Name == tmuxName {
+		if s.MuxSession != nil && s.MuxSession.Name == muxName {
 			return s
 		}
 	}
@@ -286,7 +291,7 @@ func TestDaemon_TuiosSessionClosed(t *testing.T) {
 
 	waitForSessionStatus(t, router, createResp.ID, session.StatusActive, 5*time.Second)
 
-	require.NoError(t, app.Tmux.Service.HandleSessionClosed(context.Background(), "test-session"))
+	require.NoError(t, app.Mux.Service.HandleSessionClosed(context.Background(), "test-session"))
 
 	req := httptest.NewRequest("GET", "/sessions", nil)
 	w := httptest.NewRecorder()
@@ -297,15 +302,15 @@ func TestDaemon_TuiosSessionClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, sessionsResponse.Sessions, 1)
 
-	sess := findSessionByTmuxName(sessionsResponse.Sessions, "test-session")
+	sess := findSessionByMuxName(sessionsResponse.Sessions, "test-session")
 	require.NotNil(t, sess)
 	require.Equal(t, session.StatusBroken, sess.Status)
 	require.False(t, sess.IsAttached)
 }
 
-func TestDaemon_RepairSession_AfterTmuxFailure(t *testing.T) {
+func TestDaemon_RepairSession_AfterMuxFailure(t *testing.T) {
 	_, router, mock, ws1ID, _ := setupTestRouter(t)
-	mock.SetCreateErr(fmt.Errorf("tmux down"))
+	mock.SetCreateErr(fmt.Errorf("mux down"))
 
 	body := fmt.Sprintf(`{"name":"repair-me","workspaces":[{"workspace_id":%d,"base_branch":"main"}]}`, ws1ID)
 	createResp := createSessionViaAPI(t, router, body)
@@ -329,7 +334,7 @@ func TestDaemon_RepairSession_AfterTmuxFailure(t *testing.T) {
 	err := json.Unmarshal(w.Body.Bytes(), &response)
 	require.NoError(t, err)
 	require.Equal(t, session.StatusActive, response.Status)
-	require.True(t, mock.HasSessionByName("repair-me"))
+	require.True(t, mock.HasSession("repair-me"))
 }
 
 func startMigrateAndWait(t *testing.T, router http.Handler, wsID uint) {
@@ -389,4 +394,43 @@ func TestDaemon_MigrateToBare_DetachesLinkedSessions(t *testing.T) {
 	sess, err := app.Session.Store.GetByID(createResp.ID)
 	require.NoError(t, err)
 	require.Empty(t, sess.Worktrees, "migrated repo should leave the session with no remaining worktrees")
+}
+
+func TestDaemon_MuxRoutes(t *testing.T) {
+	_, router, _, _, _, bus := setupTestRouterWithBus(t)
+
+	var published []eventbus.Event
+	bus.Subscribe(eventbus.MuxClientAttached, func(ctx context.Context, e eventbus.Event) error {
+		published = append(published, e)
+		return nil
+	})
+
+	tests := []struct {
+		method   string
+		path     string
+		body     string
+		wantCode int
+		wantBody func(t *testing.T, body string)
+	}{
+		{"PUT", "/mux/hooks/client-attached", `{"session_name":"x"}`, http.StatusOK, nil},
+		{"GET", "/mux/sessions/nope/env/K", "", http.StatusNotFound, func(t *testing.T, body string) {
+			require.Empty(t, body)
+		}},
+		{"PUT", "/tmux/hooks/client-attached", `{"session_name":"x"}`, http.StatusNotFound, func(t *testing.T, body string) {
+			require.Contains(t, body, "404 page not found")
+		}},
+	}
+	for _, tt := range tests {
+		req := httptest.NewRequest(tt.method, tt.path, bytes.NewReader([]byte(tt.body)))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, tt.wantCode, w.Code, "%s %s", tt.method, tt.path)
+		if tt.wantBody != nil {
+			tt.wantBody(t, w.Body.String())
+		}
+	}
+
+	require.Len(t, published, 1)
+	require.Equal(t, eventbus.MuxHookEvent{SessionName: "x"}, published[0].Data)
 }

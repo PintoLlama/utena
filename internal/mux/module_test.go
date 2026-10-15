@@ -1,4 +1,4 @@
-package tmux
+package mux
 
 import (
 	"testing"
@@ -8,25 +8,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTmuxModule_Models(t *testing.T) {
+func TestModule_Models(t *testing.T) {
 	database := testdb.New(t)
 
 	bus := eventbus.NewEventBus()
-	mock := NewMockRunner()
-	store := NewTmuxStore(database)
-	module := NewTmuxModuleWithRunner(mock, store, bus)
+	mock := NewFakeDriver()
+	module := NewModule(mock, bus, database)
 
 	models := module.Models()
 	require.Len(t, models, 1)
 }
 
-func TestTmuxModule_InitializesWithoutError(t *testing.T) {
+func TestModule_InitializesWithoutError(t *testing.T) {
 	database := testdb.New(t)
 
 	bus := eventbus.NewEventBus()
-	mock := NewMockRunner()
-	store := NewTmuxStore(database)
-	module := NewTmuxModuleWithRunner(mock, store, bus)
+	mock := NewFakeDriver()
+	module := NewModule(mock, bus, database)
 
 	require.NotNil(t, module.Service)
 	require.NotNil(t, module.Controller)

@@ -9,9 +9,10 @@ import (
 	"github.com/eleonorayaya/utena/internal/db"
 	"github.com/eleonorayaya/utena/internal/eventbus"
 	"github.com/eleonorayaya/utena/internal/jobs"
-	utmux "github.com/eleonorayaya/utena/internal/tmux"
+	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/go-chi/chi/v5"
+	"gorm.io/gorm"
 )
 
 type SessionModule struct {
@@ -21,13 +22,13 @@ type SessionModule struct {
 	Router     *SessionRouter
 }
 
-func NewSessionModule(tmuxService *utmux.TmuxService, workspaceModule *workspace.WorkspaceModule, bus eventbus.EventBus, database db.Database, branchPrefix string, configDir string, sessionsRoot string) *SessionModule {
+func NewSessionModule(muxService *mux.Service, workspaceModule *workspace.WorkspaceModule, bus eventbus.EventBus, database db.Database, branchPrefix string, configDir string, sessionsRoot string) *SessionModule {
 	store := NewSessionStore(database)
 	dismissedPRStore := NewDismissedPRStore(database)
 	sessionActionStore := NewSessionActionStore(database)
 	sessionWorktreeStore := NewSessionWorktreeStore(database)
 	setupStepStore := NewSessionSetupStepStore(database)
-	service := NewSessionService(store, sessionWorktreeStore, dismissedPRStore, sessionActionStore, setupStepStore, workspaceModule.Service, workspaceModule.GitService, tmuxService, bus, branchPrefix, configDir, sessionsRoot)
+	service := NewSessionService(store, sessionWorktreeStore, dismissedPRStore, sessionActionStore, setupStepStore, workspaceModule.Service, workspaceModule.GitService, muxService, bus, branchPrefix, configDir, sessionsRoot)
 	controller := NewSessionController(service)
 	router := NewSessionRouter(controller)
 
@@ -65,6 +66,55 @@ func (m *SessionModule) OnAppEnd(ctx context.Context) error {
 
 func (m *SessionModule) Models() []any {
 	return []any{&Session{}, &SessionWorktree{}, &SessionBranch{}, &DismissedPR{}, &SessionAction{}, &SessionSetupStep{}, &SessionBlocker{}}
+}
+
+func (m *SessionModule) PreMigrations() []db.PreMigration {
+	return []db.PreMigration{renameTmuxSessionColumn, dropTmuxSessionNameColumn, renameSetupTmuxSteps}
+}
+
+func dropTmuxSessionNameColumn(tx *gorm.DB) error {
+	mg := tx.Migrator()
+	if err := db.DropIndexesIfExist(mg, "sessions", "idx_sessions_tmux_session_name"); err != nil {
+		return err
+	}
+	if !mg.HasColumn("sessions", "tmux_session_name") {
+		return nil
+	}
+	return tx.Exec("ALTER TABLE sessions DROP COLUMN tmux_session_name").Error
+}
+
+func renameSetupTmuxSteps(tx *gorm.DB) error {
+	if !tx.Migrator().HasTable("session_setup_steps") {
+		return nil
+	}
+	if err := tx.Exec("UPDATE session_setup_steps SET kind = ? WHERE kind = ?", string(StepKindSetupMux), "setup_tmux").Error; err != nil {
+		return err
+	}
+	return tx.Exec("UPDATE session_setup_steps SET label = ? WHERE kind = ? AND label = ?", setupMuxLabel, string(StepKindSetupMux), "Setup tmux").Error
+}
+
+func renameTmuxSessionColumn(tx *gorm.DB) error {
+	mg := tx.Migrator()
+	if err := db.DropConstraintIfExists(mg, "sessions", "fk_sessions_tmux_session"); err != nil {
+		return err
+	}
+	if err := db.DropIndexesIfExist(mg, "sessions", "idx_sessions_tmux_session_id"); err != nil {
+		return err
+	}
+	if !mg.HasColumn("sessions", "tmux_session_id") {
+		return nil
+	}
+	if !mg.HasColumn("sessions", "mux_session_id") {
+		return mg.RenameColumn("sessions", "tmux_session_id", "mux_session_id")
+	}
+	var linked int64
+	if err := tx.Table("sessions").Unscoped().Where("tmux_session_id IS NOT NULL").Count(&linked).Error; err != nil {
+		return err
+	}
+	if linked > 0 {
+		return fmt.Errorf("sessions has both tmux_session_id and mux_session_id columns")
+	}
+	return tx.Exec("ALTER TABLE sessions DROP COLUMN tmux_session_id").Error
 }
 
 func (m *SessionModule) Routes() chi.Router {

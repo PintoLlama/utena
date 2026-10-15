@@ -11,13 +11,13 @@ import (
 
 	"github.com/eleonorayaya/utena/internal/eventbus"
 	"github.com/eleonorayaya/utena/internal/git"
-	utmux "github.com/eleonorayaya/utena/internal/tmux"
+	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/require"
 )
 
-func setupSessionRouter(t *testing.T) (*SessionRouter, *SessionStore, *workspace.WorkspaceStore, *utmux.MockRunner, uint, uint) {
+func setupSessionRouter(t *testing.T) (*SessionRouter, *SessionStore, *workspace.WorkspaceStore, *mux.FakeDriver, uint, uint) {
 	t.Helper()
 
 	database := setupTestDB(t)
@@ -30,14 +30,14 @@ func setupSessionRouter(t *testing.T) (*SessionRouter, *SessionStore, *workspace
 	require.NoError(t, workspaceStore.Add(ws1))
 	require.NoError(t, workspaceStore.Add(ws2))
 
-	mock := utmux.NewMockRunner()
-	tmuxService := createTmuxService(t, database, mock, bus)
+	mock := mux.NewFakeDriver()
+	muxService := createMuxService(t, database, mock, bus)
 	gitService := git.NewGitService(database)
 	workspaceService := workspace.NewWorkspaceService(workspaceStore, gitService)
 	dismissedPRStore := NewDismissedPRStore(database)
 	sessionActionStore := NewSessionActionStore(database)
 	sessionWorktreeStore := NewSessionWorktreeStore(database)
-	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, tmuxService, bus, "eqt/", t.TempDir(), t.TempDir())
+	service := NewSessionService(sessionStore, sessionWorktreeStore, dismissedPRStore, sessionActionStore, NewSessionSetupStepStore(database), workspaceService, gitService, muxService, bus, "eqt/", t.TempDir(), t.TempDir())
 	controller := NewSessionController(service)
 	router := NewSessionRouter(controller)
 
@@ -254,9 +254,9 @@ func TestSessionRouter_RepairSession_NotFound(t *testing.T) {
 }
 
 func TestSessionRouter_RepairSession_NotBroken(t *testing.T) {
-	router, sessionStore, _, tmux, _, _ := setupSessionRouter(t)
+	router, sessionStore, _, muxDriver, _, _ := setupSessionRouter(t)
 
-	tmux.Sessions["utena-alive-session"] = true
+	require.NoError(t, muxDriver.NewSession("utena-alive-session", "", nil))
 	session := &Session{
 		Name:       "alive-session",
 		Status:     StatusActive,
