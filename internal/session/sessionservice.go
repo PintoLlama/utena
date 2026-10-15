@@ -195,6 +195,45 @@ func (s *SessionService) ListSessions(ctx context.Context, statuses ...SessionSt
 	return sessions, nil
 }
 
+func (s *SessionService) ResourceUsage(ctx context.Context) (*SessionResourcesResponse, error) {
+	usages, err := s.muxService.ResourceUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(usages))
+	for i, u := range usages {
+		names[i] = u.Session
+	}
+	refs, err := s.store.ListByMuxNames(names)
+	if err != nil {
+		return nil, err
+	}
+	byMux := make(map[string]MuxSessionRef, len(refs))
+	for _, ref := range refs {
+		byMux[ref.MuxName] = ref
+	}
+
+	rows := make([]SessionResources, 0, len(usages))
+	for _, u := range usages {
+		row := SessionResources{
+			Name:       u.Session,
+			MuxSession: u.Session,
+			Status:     ResourceStatusUnmanaged,
+			CPUPercent: u.CPUPercent,
+			RSSBytes:   u.RSSBytes,
+			Procs:      u.Procs,
+			Processes:  u.Processes,
+		}
+		if ref, ok := byMux[u.Session]; ok {
+			row.SessionID = &ref.ID
+			row.Name = ref.Name
+			row.Status = string(ref.Status)
+		}
+		rows = append(rows, row)
+	}
+	return &SessionResourcesResponse{Sessions: rows, SampledAt: time.Now()}, nil
+}
+
 func (s *SessionService) attachPullRequests(sessions []Session) {
 	var branchIDs []uint
 	for i := range sessions {
