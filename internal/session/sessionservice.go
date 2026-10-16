@@ -275,6 +275,10 @@ func (s *SessionService) ListSessionsByWorkspace(ctx context.Context, workspaceI
 	return sessions, nil
 }
 
+func (s *SessionService) AttachedSessionID(ctx context.Context) (uint, error) {
+	return s.store.AttachedID()
+}
+
 func (s *SessionService) GetSession(ctx context.Context, id uint) (*Session, error) {
 	sess, err := s.store.GetByID(id)
 	if err != nil {
@@ -1178,6 +1182,7 @@ func (s *SessionService) ActivateSession(ctx context.Context, id uint) (*Session
 	if err := s.store.Update(session); err != nil {
 		return nil, err
 	}
+	s.publishSessionAttached(ctx, session.ID)
 
 	wsCache := make(map[uint]*workspace.Workspace)
 	for i := range session.Worktrees {
@@ -1454,7 +1459,11 @@ func (s *SessionService) handleMuxClientSessionChanged(ctx context.Context, even
 
 	sess.IsAttached = true
 	sess.LastUsedAt = time.Now()
-	return s.store.Update(sess)
+	if err := s.store.Update(sess); err != nil {
+		return err
+	}
+	s.publishSessionAttached(ctx, sess.ID)
+	return nil
 }
 
 func (s *SessionService) handleMuxClientAttached(ctx context.Context, event eventbus.Event) error {
@@ -1471,7 +1480,20 @@ func (s *SessionService) handleMuxClientAttached(ctx context.Context, event even
 
 	sess.IsAttached = true
 	sess.LastUsedAt = time.Now()
-	return s.store.Update(sess)
+	if err := s.store.Update(sess); err != nil {
+		return err
+	}
+	s.publishSessionAttached(ctx, sess.ID)
+	return nil
+}
+
+func (s *SessionService) publishSessionAttached(ctx context.Context, sessionID uint) {
+	if err := s.eventBus.Publish(ctx, eventbus.Event{
+		Type: eventbus.SessionAttached,
+		Data: eventbus.SessionIDEvent{SessionID: sessionID},
+	}); err != nil {
+		slog.Warn("failed to publish session attached event", "session", sessionID, "error", err)
+	}
 }
 
 func (s *SessionService) handleMuxClientDetached(ctx context.Context, event eventbus.Event) error {

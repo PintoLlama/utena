@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/eleonorayaya/utena/internal/wm"
 )
 
 var (
@@ -20,6 +22,17 @@ var (
 type Sessions interface {
 	IsAttached(ctx context.Context, sessionID uint) (bool, error)
 	Activate(ctx context.Context, sessionID uint) error
+	Attached(ctx context.Context) (uint, error)
+}
+
+const (
+	createdLinkPoll = 100 * time.Millisecond
+	createdLinkWait = 1500 * time.Millisecond
+)
+
+type Layout struct {
+	BrowserWorkspace string
+	ParkWorkspace    string
 }
 
 type OpenRequest struct {
@@ -48,7 +61,12 @@ type Service struct {
 	driver   Driver
 	store    *Store
 	sessions Sessions
+	wm       wm.Driver
+	wmInert  bool
+	layout   Layout
 	now      func() time.Time
+	attached atomic.Uint64
+	swapCh   chan struct{}
 
 	mu                  sync.Mutex
 	connected           atomic.Bool
@@ -57,10 +75,42 @@ type Service struct {
 	unowned             map[string]struct{}
 	run                 string
 	runLoaded           bool
+	links               linker
+	placedFor           uint
 }
 
-func NewService(driver Driver, store *Store, sessions Sessions) *Service {
-	return &Service{driver: driver, store: store, sessions: sessions, now: time.Now, unowned: map[string]struct{}{}}
+func NewService(driver Driver, store *Store, sessions Sessions, wmDriver wm.Driver, layout Layout) *Service {
+	return &Service{
+		driver:   driver,
+		store:    store,
+		sessions: sessions,
+		wm:       wmDriver,
+		wmInert:  isInert(wmDriver),
+		layout:   layout,
+		now:      time.Now,
+		swapCh:   make(chan struct{}, 1),
+		unowned:  map[string]struct{}{},
+	}
+}
+
+func isInert(d wm.Driver) bool {
+	switch d.(type) {
+	case wm.None, *wm.None:
+		return true
+	}
+	return false
+}
+
+func (s *Service) SetAttached(sessionID uint) {
+	s.attached.Store(uint64(sessionID))
+	s.signal()
+}
+
+func (s *Service) signal() {
+	select {
+	case s.swapCh <- struct{}{}:
+	default:
+	}
 }
 
 func driverErr(err error) error {
@@ -93,9 +143,13 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 				return OpenResult{}, err
 			}
 			activated = true
+			s.SetAttached(req.SessionID)
 		default:
 			focus = attached
 		}
+	}
+	if focus && req.SessionID != 0 && uint(s.attached.Load()) != req.SessionID {
+		s.SetAttached(req.SessionID)
 	}
 
 	s.mu.Lock()
@@ -114,8 +168,11 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 	}
 
 	res := OpenResult{Activated: activated}
+	var wmTarget wm.Window
+	wmFound := false
 	switch {
 	case !found:
+		before, track := s.wmSnapshot(ctx)
 		w, err := s.driver.CreateWindow(ctx, []string{req.URL}, focus)
 		if err != nil {
 			return OpenResult{}, driverErr(err)
@@ -127,12 +184,29 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 			if err := s.store.Add(row); err != nil {
 				return OpenResult{}, err
 			}
+			s.signal()
+		}
+		if track {
+			s.linkCreated(ctx, w.ID, before, live)
+		}
+		if focus {
+			wmTarget, wmFound = s.wmFocusTarget(ctx, func([]wm.Window) (string, bool) {
+				wmID, ok := s.links.links[w.ID]
+				return wmID, ok
+			})
 		}
 		res.WindowID, res.Created = w.ID, true
 		if len(w.Tabs) > 0 {
 			res.TabID = w.Tabs[0].ID
 		}
 	default:
+		if focus {
+			s.ensurePlacedLocked(ctx)
+			wmTarget, wmFound = s.wmFocusTarget(ctx, func(wmWindows []wm.Window) (string, bool) {
+				wmID, ok := s.links.resolve(live, s.driver.WindowTitle, wmWindows, []string{target.ID})[target.ID]
+				return wmID, ok
+			})
+		}
 		res.WindowID = target.ID
 		if tab, ok := MatchTab(target.Tabs, req.URL); ok {
 			if err := s.driver.ActivateTab(ctx, target.ID, tab.ID); err != nil {
@@ -154,8 +228,108 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 		} else {
 			res.Focused = true
 		}
+		switch {
+		case s.wmInert:
+		case !wmFound:
+			slog.WarnContext(ctx, "browser: no wm window to focus", "window", res.WindowID)
+		default:
+			if s.wmFocus(ctx, res.WindowID, wmTarget) {
+				res.Focused = true
+			}
+		}
 	}
 	return res, nil
+}
+
+func (s *Service) wmFocus(ctx context.Context, windowID string, target wm.Window) bool {
+	if target.Workspace == s.layout.ParkWorkspace {
+		if err := s.wm.MoveToWorkspace(ctx, target.ID, s.layout.BrowserWorkspace); err != nil {
+			slog.WarnContext(ctx, "browser: unpark before focus failed", "window", windowID, "wm_window", target.ID, "error", err)
+			return false
+		}
+	}
+	if err := s.wm.FocusWindow(ctx, target.ID); err != nil {
+		slog.WarnContext(ctx, "browser: wm focus window failed", "window", windowID, "wm_window", target.ID, "error", err)
+		return false
+	}
+	return true
+}
+
+func (s *Service) wmFocusTarget(ctx context.Context, link func([]wm.Window) (string, bool)) (wm.Window, bool) {
+	if s.wmInert {
+		return wm.Window{}, false
+	}
+	wmWindows, err := s.wm.ListWindows(ctx, s.driver.AppBundleID())
+	if err != nil {
+		slog.WarnContext(ctx, "browser: list wm windows failed", "error", err)
+		return wm.Window{}, false
+	}
+	wmID, ok := link(wmWindows)
+	if !ok {
+		return wm.Window{}, false
+	}
+	for _, w := range wmWindows {
+		if w.ID == wmID {
+			return w, true
+		}
+	}
+	return wm.Window{}, false
+}
+
+func (s *Service) wmSnapshot(ctx context.Context) ([]wm.Window, bool) {
+	if s.wmInert {
+		return nil, false
+	}
+	before, err := s.wm.ListWindows(ctx, s.driver.AppBundleID())
+	if err != nil {
+		slog.WarnContext(ctx, "browser: list wm windows failed", "error", err)
+		return nil, false
+	}
+	return before, true
+}
+
+func (s *Service) linkCreated(ctx context.Context, windowID string, before []wm.Window, live []Window) {
+	deadline := time.Now().Add(createdLinkWait)
+	for {
+		after, err := s.wm.ListWindows(ctx, s.driver.AppBundleID())
+		if err != nil {
+			slog.WarnContext(ctx, "browser: list wm windows failed; created window not linked", "window", windowID, "error", err)
+			return
+		}
+		if s.links.linkCreated(windowID, before, after) {
+			if !s.onlyNewBrowserWindow(ctx, windowID, live) {
+				delete(s.links.links, windowID)
+				slog.DebugContext(ctx, "browser: created window link dropped; another browser window appeared", "window", windowID)
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			slog.DebugContext(ctx, "browser: created window not linked", "window", windowID)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(createdLinkPoll):
+		}
+	}
+}
+
+func (s *Service) onlyNewBrowserWindow(ctx context.Context, windowID string, live []Window) bool {
+	now, err := s.driver.ListWindows(ctx)
+	if err != nil {
+		return false
+	}
+	existing := make(map[string]bool, len(live))
+	for _, w := range live {
+		existing[w.ID] = true
+	}
+	for _, w := range now {
+		if !existing[w.ID] && w.ID != windowID {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) targetWindow(sessionID uint, live []Window) (Window, bool, error) {
@@ -194,7 +368,86 @@ func (s *Service) targetWindow(sessionID uint, live []Window) (Window, bool, err
 
 func (s *Service) OnAppStart(ctx context.Context) error {
 	go s.followEvents(ctx)
+	go s.placeLoop(ctx)
 	return nil
+}
+
+func (s *Service) placeLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.swapCh:
+			if err := s.place(ctx); err != nil {
+				slog.WarnContext(ctx, "browser: placement failed", "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) place(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.placeLocked(ctx)
+}
+
+func (s *Service) placeLocked(ctx context.Context) error {
+	if !s.connected.Load() || s.wmInert {
+		return nil
+	}
+	attached := uint(s.attached.Load())
+
+	live, err := s.driver.ListWindows(ctx)
+	if err != nil {
+		return err
+	}
+	wmWindows, err := s.wm.ListWindows(ctx, s.driver.AppBundleID())
+	if err != nil {
+		return err
+	}
+	rows, err := s.store.ListOpen()
+	if err != nil {
+		return err
+	}
+
+	want := make([]string, 0, len(rows))
+	for _, r := range rows {
+		want = append(want, r.DriverWindowID)
+	}
+	links := s.links.resolve(live, s.driver.WindowTitle, wmWindows, want)
+	workspaces := make(map[string]string, len(wmWindows))
+	for _, w := range wmWindows {
+		workspaces[w.ID] = w.Workspace
+	}
+
+	for _, r := range rows {
+		wmID, ok := links[r.DriverWindowID]
+		if !ok {
+			slog.DebugContext(ctx, "browser: window not linked to wm window", "window", r.DriverWindowID, "session", r.SessionID)
+			continue
+		}
+		target := s.layout.ParkWorkspace
+		if attached != 0 && r.SessionID == attached {
+			target = s.layout.BrowserWorkspace
+		}
+		if workspaces[wmID] == target {
+			continue
+		}
+		if err := s.wm.MoveToWorkspace(ctx, wmID, target); err != nil {
+			slog.WarnContext(ctx, "browser: move window failed", "window", r.DriverWindowID, "wm_window", wmID, "workspace", target, "error", err)
+		}
+	}
+	s.placedFor = attached
+	return nil
+}
+
+func (s *Service) ensurePlacedLocked(ctx context.Context) {
+	if s.placedFor == uint(s.attached.Load()) {
+		return
+	}
+	if err := s.placeLocked(ctx); err != nil {
+		slog.WarnContext(ctx, "browser: placement before focus failed", "error", err)
+	}
 }
 
 func (s *Service) OnAppEnd(ctx context.Context) error {
@@ -232,12 +485,15 @@ func (s *Service) handleEvent(ctx context.Context, ev Event) {
 	case EventConnected:
 		s.connected.Store(true)
 		err = errors.Join(s.trackRun(ev.Run), s.resync(ctx))
+		s.signal()
 	case EventDisconnected:
 		s.connected.Store(false)
 	case EventWindowCreated:
 		err = s.adopt(ev.WindowID)
 	case EventWindowRemoved:
 		err = s.store.DeleteByDriverWindowID(ev.WindowID)
+	case EventTabsChanged:
+		err = s.signalIfUnlinked(ev.WindowID)
 	case EventFocusChanged:
 		if ev.WindowID == "" {
 			return
@@ -251,6 +507,19 @@ func (s *Service) handleEvent(ctx context.Context, ev Event) {
 	if err != nil {
 		slog.WarnContext(ctx, "browser event handler failed", "type", ev.Type, "window", ev.WindowID, "error", err)
 	}
+}
+
+func (s *Service) signalIfUnlinked(windowID string) error {
+	if _, ok := s.links.links[windowID]; ok {
+		return nil
+	}
+	if _, err := s.store.GetByDriverWindowID(windowID); errors.Is(err, ErrWindowNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	s.signal()
+	return nil
 }
 
 func (s *Service) trackRun(run string) error {
@@ -292,7 +561,19 @@ func (s *Service) resync(ctx context.Context) error {
 			s.lastFocusedWindowID = w.ID
 		}
 	}
-	return s.store.MarkMissingExcept(live)
+	return errors.Join(s.store.MarkMissingExcept(live), s.seedAttached(ctx))
+}
+
+func (s *Service) seedAttached(ctx context.Context) error {
+	if s.attached.Load() != 0 {
+		return nil
+	}
+	id, err := s.sessions.Attached(ctx)
+	if err != nil {
+		return err
+	}
+	s.attached.CompareAndSwap(0, uint64(id))
+	return nil
 }
 
 func (s *Service) adopt(windowID string) error {
@@ -316,5 +597,9 @@ func (s *Service) adopt(windowID string) error {
 	if err != nil {
 		return err
 	}
-	return s.store.Add(&BrowserWindow{SessionID: parent.SessionID, State: WindowOpen, DriverWindowID: windowID, LastFocusedAt: s.now()})
+	if err := s.store.Add(&BrowserWindow{SessionID: parent.SessionID, State: WindowOpen, DriverWindowID: windowID, LastFocusedAt: s.now()}); err != nil {
+		return err
+	}
+	s.signal()
+	return nil
 }
