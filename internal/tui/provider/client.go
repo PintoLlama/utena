@@ -13,7 +13,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/eleonorayaya/utena/internal/browser"
 	"github.com/eleonorayaya/utena/internal/session"
+	"github.com/eleonorayaya/utena/internal/tui/ui"
 	"github.com/eleonorayaya/utena/internal/workspace"
 )
 
@@ -619,5 +621,22 @@ func (c *client) deleteBlocker(sessionID, blockerID uint) tea.Cmd {
 			return parseAPIError(res, "delete blocker")
 		}
 		return blockerChangedMsg{}
+	}
+}
+
+func (c *client) openURL(sessionID uint, link string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		req := browser.OpenRequest{SessionID: sessionID, URL: link, Activate: true}
+		res, err := browser.RequestOpen(ctx, http.DefaultClient, c.baseURL+"/browser", req)
+		if err != nil {
+			log.Printf("[WARN] browser open via daemon failed, falling back: %v", err)
+			return ui.OpenURL(link)()
+		}
+		if res.Activated {
+			return SessionSwitchedMsg{}
+		}
+		return nil
 	}
 }
