@@ -624,6 +624,55 @@ func (c *client) deleteBlocker(sessionID, blockerID uint) tea.Cmd {
 	}
 }
 
+func (c *client) fetchBrowserState() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/browser/sessions", nil)
+		if err != nil {
+			return nil
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil
+		}
+		defer res.Body.Close()
+
+		empty := browser.SessionsView{Sessions: map[uint]browser.SessionBrowser{}}
+		switch res.StatusCode {
+		case http.StatusOK:
+		case http.StatusNotFound:
+			return browserStateLoadedMsg{state: empty}
+		default:
+			return nil
+		}
+		var view browser.SessionsView
+		if err := json.NewDecoder(res.Body).Decode(&view); err != nil {
+			return nil
+		}
+		if view.Sessions == nil {
+			view.Sessions = empty.Sessions
+		}
+		return browserStateLoadedMsg{state: view}
+	}
+}
+
+func (c *client) focusTab(sessionID uint, windowID, tabID string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		out, err := browser.RequestFocus(ctx, http.DefaultClient, c.baseURL+"/browser", browser.FocusRequest{SessionID: sessionID, WindowID: windowID, TabID: tabID})
+		if err != nil {
+			log.Printf("[ERROR] focus tab %s/%s: %v", windowID, tabID, err)
+			return browserFocusFailedMsg{err}
+		}
+		if out.Activated {
+			return SessionSwitchedMsg{}
+		}
+		return browserFocusedMsg{}
+	}
+}
+
 func (c *client) openURL(sessionID uint, link string) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

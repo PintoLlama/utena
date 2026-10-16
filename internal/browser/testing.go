@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 type FakeDriver struct {
@@ -20,9 +21,25 @@ type FakeDriver struct {
 	OnCreate  func(Window)
 	OnFocus   func(windowID string)
 	OnClose   func(windowID string)
+	outdated  atomic.Bool
 }
 
-var _ Driver = (*FakeDriver)(nil)
+var (
+	_ Driver         = (*FakeDriver)(nil)
+	_ StatusReporter = (*FakeDriver)(nil)
+)
+
+func (f *FakeDriver) SetOutdated(outdated bool) {
+	f.outdated.Store(outdated)
+}
+
+func (f *FakeDriver) Outdated() bool {
+	return f.outdated.Load()
+}
+
+func (f *FakeDriver) UpdateHint() string {
+	return "reload the fake extension"
+}
 
 func NewFakeDriver() *FakeDriver {
 	return &FakeDriver{}

@@ -5,14 +5,20 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/x/ansi"
 )
 
-var newlines = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ")
+var newlines = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ", "\t", " ")
 
 func SingleLine(s string) string {
-	return newlines.Replace(s)
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, ansi.Strip(newlines.Replace(s)))
 }
 
 func Truncate(s string, width int) string {

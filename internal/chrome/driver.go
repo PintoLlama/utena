@@ -25,15 +25,19 @@ type Driver struct {
 	stateChanged chan struct{}
 	nextID       atomic.Int64
 	timeout      time.Duration
+	outdated     atomic.Bool
 
 	queuedMu   sync.Mutex
 	queuedTabs map[queuedEvent]struct{}
 }
 
 var (
-	_ browser.Driver     = (*Driver)(nil)
-	_ browser.HTTPDriver = (*Driver)(nil)
+	_ browser.Driver         = (*Driver)(nil)
+	_ browser.HTTPDriver     = (*Driver)(nil)
+	_ browser.StatusReporter = (*Driver)(nil)
 )
+
+var errProtocolMismatch = errors.New("protocol mismatch")
 
 type queuedEvent struct {
 	gen uint64
@@ -59,6 +63,14 @@ func NewDriver() *Driver {
 
 func (d *Driver) Name() string {
 	return "chrome"
+}
+
+func (d *Driver) Outdated() bool {
+	return d.outdated.Load()
+}
+
+func (d *Driver) UpdateHint() string {
+	return "reload it in chrome://extensions"
 }
 
 func (d *Driver) AppBundleID() string {
@@ -93,10 +105,14 @@ func (d *Driver) serve(w http.ResponseWriter, r *http.Request) {
 
 	run, err := readHello(ctx, ws)
 	if err != nil {
+		if errors.Is(err, errProtocolMismatch) {
+			d.markOutdated()
+		}
 		slog.Warn("chrome: extension rejected", "error", err)
 		_ = ws.Close(websocket.StatusPolicyViolation, err.Error())
 		return
 	}
+	d.outdated.Store(false)
 
 	c := &conn{ws: ws, run: run, pending: make(map[int64]chan message)}
 	d.swap(c)
@@ -121,9 +137,17 @@ func readHello(ctx context.Context, ws *websocket.Conn) (string, error) {
 		return "", fmt.Errorf("expected hello, got %q", m.Type)
 	}
 	if m.Protocol != ProtocolVersion {
-		return "", fmt.Errorf("extension protocol %d, daemon expects %d; reload the extension", m.Protocol, ProtocolVersion)
+		return "", fmt.Errorf("%w: extension protocol %d, daemon expects %d; reload the extension", errProtocolMismatch, m.Protocol, ProtocolVersion)
 	}
 	return m.Run, nil
+}
+
+func (d *Driver) markOutdated() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.conn == nil {
+		d.outdated.Store(true)
+	}
 }
 
 func (d *Driver) swap(c *conn) {

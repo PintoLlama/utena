@@ -9,10 +9,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/eleonorayaya/utena/internal/browser"
 	"github.com/eleonorayaya/utena/internal/claude"
 	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/session"
 	"github.com/eleonorayaya/utena/internal/tui/provider"
+	"github.com/eleonorayaya/utena/internal/tui/ui"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -301,4 +303,50 @@ func TestSplitView_ListHasGutterBeforeDivider(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 120, lipgloss.Width(strings.Split(m.View(), "\n")[0]))
+}
+
+func outdatedState() provider.BrowserStateUpdatedMsg {
+	return provider.BrowserStateUpdatedMsg{State: browser.SessionsView{Outdated: true, UpdateHint: "reload it in chrome://extensions", Sessions: map[uint]browser.SessionBrowser{}}}
+}
+
+func TestSessionList_OutdatedExtensionWarning(t *testing.T) {
+	m, _ := New().Update(outdatedState())
+	assert.Equal(t, ui.Status{Text: "browser extension outdated — reload it in chrome://extensions", Kind: ui.StatusWarning}, m.Status())
+
+	m, _ = m.Update(provider.BrowserStateUpdatedMsg{State: browser.SessionsView{Sessions: map[uint]browser.SessionBrowser{}}})
+	assert.True(t, m.Status().Empty())
+}
+
+func TestSessionList_OutdatedWarningDoesNotClobberActionStatus(t *testing.T) {
+	m, _ := New().Update(provider.SessionsStateUpdatedMsg{Sessions: []session.Session{withClaude(1, "x", claude.StatusIdle)}})
+	m, _, _ = pressA(m)
+	m, _ = m.Update(outdatedState())
+	assert.Contains(t, m.Status().Text, "press a again")
+
+	m, _, _ = m.OnKeyMsg(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	assert.Contains(t, m.Status().Text, "browser extension outdated")
+}
+
+func TestSessionList_SplitPreviewShowsBrowserSection(t *testing.T) {
+	m, _ := New().Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, _ = m.Update(provider.SessionsStateUpdatedMsg{Sessions: []session.Session{withClaude(7, "web", claude.StatusIdle)}})
+	m, _ = m.Update(provider.BrowserStateUpdatedMsg{State: browser.SessionsView{Sessions: map[uint]browser.SessionBrowser{
+		7: {State: "open", TabCount: 1, Windows: []browser.WindowView{{ID: "w1", State: "open", Tabs: []browser.TabView{{ID: "t1", Title: "Preview tab", URL: "https://x.example.com", Active: true}}}}},
+	}}})
+	out := m.View()
+	assert.Contains(t, out, "Browser")
+	assert.Contains(t, out, "Preview tab")
+	assert.NotContains(t, out, "▌ ●")
+}
+
+func TestSessionList_InitRequestsBrowserState(t *testing.T) {
+	_, cmd := New().Init()
+	require.NotNil(t, cmd)
+	batch, ok := cmd().(tea.BatchMsg)
+	require.True(t, ok)
+	var got []string
+	for _, c := range batch {
+		got = append(got, reflect.TypeOf(c()).String())
+	}
+	assert.ElementsMatch(t, []string{"provider.fetchSessionsIntentMsg", "provider.requestBrowserStateMsg"}, got)
 }

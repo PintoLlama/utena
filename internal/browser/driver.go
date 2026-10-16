@@ -20,6 +20,11 @@ type Driver interface {
 	WindowTitle(w Window) string
 }
 
+type StatusReporter interface {
+	Outdated() bool
+	UpdateHint() string
+}
+
 type HTTPDriver interface {
 	Name() string
 	Handler() http.Handler

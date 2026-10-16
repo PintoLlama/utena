@@ -11,11 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eleonorayaya/utena/internal/common"
 	"github.com/eleonorayaya/utena/internal/wm"
 )
 
 var (
-	ErrUnavailable     = errors.New("browser unavailable")
+	ErrUnavailable     = common.NewUnavailable("browser unavailable")
 	ErrSessionNotFound = errors.New("browser: session not found")
 )
 
@@ -191,17 +192,16 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 		case err != nil:
 			return OpenResult{}, err
 		case req.Activate && !attached:
-			if err := s.sessions.Activate(ctx, req.SessionID); err != nil {
+			if err := s.activate(ctx, req.SessionID); err != nil {
 				return OpenResult{}, err
 			}
 			activated = true
-			s.SetAttached(req.SessionID)
 		default:
 			focus = attached
 		}
 	}
-	if focus && req.SessionID != 0 && uint(s.attached.Load()) != req.SessionID {
-		s.SetAttached(req.SessionID)
+	if focus && req.SessionID != 0 {
+		s.claimAttached(req.SessionID)
 	}
 
 	s.mu.Lock()
@@ -273,11 +273,7 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 		}
 	default:
 		if focus {
-			s.ensurePlacedLocked(ctx)
-			wmTarget, wmFound = s.wmFocusTarget(ctx, func(wmWindows []wm.Window) (string, bool) {
-				wmID, ok := s.links.resolve(live, s.driver.WindowTitle, wmWindows, []string{target.ID})[target.ID]
-				return wmID, ok
-			})
+			wmTarget, wmFound = s.wmTargetFor(ctx, live, target.ID)
 		}
 		res.WindowID = target.ID
 		if tab, ok := MatchTab(target.Tabs, req.URL); ok {
@@ -295,22 +291,50 @@ func (s *Service) Open(ctx context.Context, req OpenRequest) (OpenResult, error)
 	}
 
 	if focus {
-		if err := s.driver.FocusWindow(ctx, res.WindowID); err != nil {
-			slog.WarnContext(ctx, "browser: focus window failed", "window", res.WindowID, "error", err)
-		} else {
-			res.Focused = true
-		}
-		switch {
-		case s.wmInert:
-		case !wmFound:
-			slog.WarnContext(ctx, "browser: no wm window to focus", "window", res.WindowID)
-		default:
-			if s.wmFocus(ctx, res.WindowID, wmTarget) {
-				res.Focused = true
-			}
-		}
+		res.Focused = s.focusLocked(ctx, res.WindowID, wmTarget, wmFound)
 	}
 	return res, nil
+}
+
+func (s *Service) activate(ctx context.Context, sessionID uint) error {
+	if err := s.sessions.Activate(ctx, sessionID); err != nil {
+		return err
+	}
+	s.SetAttached(sessionID)
+	return nil
+}
+
+func (s *Service) claimAttached(sessionID uint) {
+	if uint(s.attached.Load()) != sessionID {
+		s.SetAttached(sessionID)
+	}
+}
+
+func (s *Service) wmTargetFor(ctx context.Context, live []Window, windowID string) (wm.Window, bool) {
+	s.ensurePlacedLocked(ctx)
+	return s.wmFocusTarget(ctx, func(wmWindows []wm.Window) (string, bool) {
+		wmID, ok := s.links.resolve(live, s.driver.WindowTitle, wmWindows, []string{windowID})[windowID]
+		return wmID, ok
+	})
+}
+
+func (s *Service) focusLocked(ctx context.Context, windowID string, wmTarget wm.Window, wmFound bool) bool {
+	focused := false
+	if err := s.driver.FocusWindow(ctx, windowID); err != nil {
+		slog.WarnContext(ctx, "browser: focus window failed", "window", windowID, "error", err)
+	} else {
+		focused = true
+	}
+	switch {
+	case s.wmInert:
+	case !wmFound:
+		slog.WarnContext(ctx, "browser: no wm window to focus", "window", windowID)
+	default:
+		if s.wmFocus(ctx, windowID, wmTarget) {
+			focused = true
+		}
+	}
+	return focused
 }
 
 func (s *Service) wmFocus(ctx context.Context, windowID string, target wm.Window) bool {
@@ -616,6 +640,12 @@ func (s *Service) restoreLocked(ctx context.Context, sessionID uint) ([]Window, 
 		if restoring && r.State == WindowMissing {
 			continue
 		}
+		if len(r.Tabs) == 0 {
+			if err := s.store.Delete(r.ID); err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
 		w, err := s.restoreRow(ctx, r, deadline)
 		if err != nil {
 			errs = append(errs, driverErr(err))
@@ -633,9 +663,6 @@ func (s *Service) restoreLocked(ctx context.Context, sessionID uint) ([]Window, 
 
 func (s *Service) restoreRow(ctx context.Context, r BrowserWindow, deadline time.Time) (Window, error) {
 	urls := savedURLs(r.Tabs)
-	if len(urls) == 0 {
-		urls = []string{"chrome://newtab/"}
-	}
 	live, err := s.driver.ListWindows(ctx)
 	if err != nil {
 		return Window{}, err

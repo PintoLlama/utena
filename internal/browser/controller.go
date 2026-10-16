@@ -2,7 +2,6 @@ package browser
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"time"
 
@@ -29,11 +28,6 @@ func (c *Controller) HandleOpen(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	res, err := c.service.Open(ctx, *req)
-	if errors.Is(err, ErrUnavailable) {
-		render.Status(r, http.StatusServiceUnavailable)
-		render.JSON(w, r, map[string]string{"error": err.Error()})
-		return
-	}
 	if err != nil {
 		common.RenderError(w, r, err)
 		return
@@ -42,5 +36,27 @@ func (c *Controller) HandleOpen(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *Controller) HandleStatus(w http.ResponseWriter, r *http.Request) {
-	render.JSON(w, r, map[string]bool{"connected": c.service.Connected()})
+	render.JSON(w, r, map[string]bool{"connected": c.service.Connected(), "outdated": c.service.Outdated()})
+}
+
+func (c *Controller) HandleSessions(w http.ResponseWriter, r *http.Request) {
+	render.JSON(w, r, c.service.BrowserSessions(r.Context()))
+}
+
+func (c *Controller) HandleFocus(w http.ResponseWriter, r *http.Request) {
+	req := &FocusRequest{}
+	if err := render.Bind(r, req); err != nil {
+		common.RenderError(w, r, common.NewInvalidRequest(err.Error()))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 15*time.Second)
+	defer cancel()
+
+	res, err := c.service.FocusTab(ctx, *req)
+	if err != nil {
+		common.RenderError(w, r, err)
+		return
+	}
+	render.JSON(w, r, res)
 }

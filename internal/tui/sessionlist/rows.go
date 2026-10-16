@@ -2,6 +2,7 @@ package sessionlist
 
 import (
 	"github.com/charmbracelet/lipgloss"
+	"github.com/eleonorayaya/utena/internal/browser"
 	"github.com/eleonorayaya/utena/internal/session"
 	"github.com/eleonorayaya/utena/internal/tui/theme"
 	"github.com/eleonorayaya/utena/internal/tui/ui"
@@ -11,6 +12,7 @@ const (
 	gutterColW   = 2
 	glyphColW    = 2
 	attachedColW = 2
+	browserColW  = 2
 	prColW       = 7
 	timeColW     = 4
 )
@@ -47,8 +49,19 @@ func (m Model) renderRow(s session.Session, selected bool, width int) string {
 		{Spans: []ui.Span{ui.ClaudeGlyph(s.AttentionStatus())}, Width: glyphColW},
 		{Spans: []ui.Span{{Text: sessionDisplayName(s), Style: nameStyle(s, selected)}}},
 		{Spans: []ui.Span{attached}, Width: attachedColW},
+		{Spans: []ui.Span{browserSpan(m.browserState.Sessions[s.ID].State)}, Width: browserColW},
 		{Spans: ui.PRCountSpans(ready, draft), Width: prColW},
 		{Spans: []ui.Span{{Text: ui.ShortAgo(s.LastUsedAt), Style: muted}}, Width: timeColW, Align: ui.AlignRight},
 		{Width: gutterColW},
 	}, width, bg)
+}
+
+func browserSpan(state string) ui.Span {
+	switch browser.WindowState(state) {
+	case browser.WindowOpen:
+		return ui.Span{Text: "◫", Style: lipgloss.NewStyle().Foreground(theme.Current.AccentBlue)}
+	case browser.WindowMissing, browser.WindowSnapshotted:
+		return ui.Span{Text: "◫", Style: lipgloss.NewStyle().Foreground(theme.Current.TextMuted)}
+	}
+	return ui.Span{}
 }
