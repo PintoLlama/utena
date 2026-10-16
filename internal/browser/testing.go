@@ -7,15 +7,19 @@ import (
 )
 
 type FakeDriver struct {
-	mu       sync.Mutex
-	windows  []Window
-	nextID   int
-	focused  []string
-	events   chan Event
-	stopped  chan struct{}
-	ListErr  error
-	OnCreate func(Window)
-	OnFocus  func(windowID string)
+	mu        sync.Mutex
+	windows   []Window
+	nextID    int
+	focused   []string
+	closed    []string
+	events    chan Event
+	stopped   chan struct{}
+	ListErr   error
+	CreateErr func(urls []string) error
+	CloseErr  error
+	OnCreate  func(Window)
+	OnFocus   func(windowID string)
+	OnClose   func(windowID string)
 }
 
 var _ Driver = (*FakeDriver)(nil)
@@ -126,6 +130,12 @@ func (f *FakeDriver) ListWindows(ctx context.Context) ([]Window, error) {
 
 func (f *FakeDriver) CreateWindow(ctx context.Context, urls []string, focused bool) (Window, error) {
 	f.mu.Lock()
+	if f.CreateErr != nil {
+		if err := f.CreateErr(urls); err != nil {
+			f.mu.Unlock()
+			return Window{}, err
+		}
+	}
 	w := f.addWindowLocked(urls)
 	if focused {
 		f.focused = append(f.focused, w.ID)
@@ -178,6 +188,39 @@ func (f *FakeDriver) FocusWindow(ctx context.Context, windowID string) error {
 	f.mu.Unlock()
 	if onFocus != nil {
 		onFocus(windowID)
+	}
+	return nil
+}
+
+func (f *FakeDriver) Closed() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.closed...)
+}
+
+func (f *FakeDriver) CloseWindow(ctx context.Context, windowID string) error {
+	f.mu.Lock()
+	if f.CloseErr != nil {
+		f.mu.Unlock()
+		return f.CloseErr
+	}
+	idx := -1
+	for i, w := range f.windows {
+		if w.ID == windowID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		f.mu.Unlock()
+		return fmt.Errorf("no window %s", windowID)
+	}
+	f.windows = append(f.windows[:idx], f.windows[idx+1:]...)
+	f.closed = append(f.closed, windowID)
+	onClose := f.OnClose
+	f.mu.Unlock()
+	if onClose != nil {
+		onClose(windowID)
 	}
 	return nil
 }

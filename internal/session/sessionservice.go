@@ -1182,7 +1182,7 @@ func (s *SessionService) ActivateSession(ctx context.Context, id uint) (*Session
 	if err := s.store.Update(session); err != nil {
 		return nil, err
 	}
-	s.publishSessionAttached(ctx, session.ID)
+	s.publishSessionEvent(ctx, eventbus.SessionAttached, session.ID)
 
 	wsCache := make(map[uint]*workspace.Workspace)
 	for i := range session.Worktrees {
@@ -1240,6 +1240,7 @@ func (s *SessionService) DeleteSession(ctx context.Context, id uint, deleteBranc
 	if err := s.store.HardDelete(id); err != nil {
 		return err
 	}
+	s.publishSessionEvent(ctx, eventbus.SessionDeleted, id)
 
 	for i := range session.Worktrees {
 		wt := session.Worktrees[i].Worktree
@@ -1462,7 +1463,7 @@ func (s *SessionService) handleMuxClientSessionChanged(ctx context.Context, even
 	if err := s.store.Update(sess); err != nil {
 		return err
 	}
-	s.publishSessionAttached(ctx, sess.ID)
+	s.publishSessionEvent(ctx, eventbus.SessionAttached, sess.ID)
 	return nil
 }
 
@@ -1483,16 +1484,16 @@ func (s *SessionService) handleMuxClientAttached(ctx context.Context, event even
 	if err := s.store.Update(sess); err != nil {
 		return err
 	}
-	s.publishSessionAttached(ctx, sess.ID)
+	s.publishSessionEvent(ctx, eventbus.SessionAttached, sess.ID)
 	return nil
 }
 
-func (s *SessionService) publishSessionAttached(ctx context.Context, sessionID uint) {
+func (s *SessionService) publishSessionEvent(ctx context.Context, eventType string, sessionID uint) {
 	if err := s.eventBus.Publish(ctx, eventbus.Event{
-		Type: eventbus.SessionAttached,
+		Type: eventType,
 		Data: eventbus.SessionIDEvent{SessionID: sessionID},
 	}); err != nil {
-		slog.Warn("failed to publish session attached event", "session", sessionID, "error", err)
+		slog.Warn("failed to publish session event", "type", eventType, "session", sessionID, "error", err)
 	}
 }
 
@@ -1545,6 +1546,7 @@ func (s *SessionService) ArchiveSession(ctx context.Context, id uint) (*Session,
 	if err := s.store.Update(sess); err != nil {
 		return nil, err
 	}
+	s.publishSessionEvent(ctx, eventbus.SessionArchived, sess.ID)
 	return sess, nil
 }
 

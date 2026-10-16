@@ -9,6 +9,8 @@ const (
 
 	SessionActivated = "session.activated"
 	SessionAttached  = "session.attached"
+	SessionArchived  = "session.archived"
+	SessionDeleted   = "session.deleted"
 
 	SessionNotification = "session.notification"
 )

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -180,22 +181,44 @@ func TestDriver_CallWithoutConnection(t *testing.T) {
 }
 
 func TestDriver_RejectsProtocolMismatch(t *testing.T) {
-	d, srv, rec := newDriver(t)
-	ws, err := dial(t, srv, "chrome-extension://abc")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = ws.CloseNow() })
-	ext := &fakeExt{ws: ws}
-	ext.send(t, map[string]any{"type": "hello", "protocol": ProtocolVersion + 1, "browser": "chrome"})
+	for _, protocol := range []int{1, ProtocolVersion + 1} {
+		t.Run(strconv.Itoa(protocol), func(t *testing.T) {
+			d, srv, rec := newDriver(t)
+			ws, err := dial(t, srv, "chrome-extension://abc")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = ws.CloseNow() })
+			ext := &fakeExt{ws: ws}
+			ext.send(t, map[string]any{"type": "hello", "protocol": protocol, "browser": "chrome"})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for err == nil {
-		_, _, err = ws.Read(ctx)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			for err == nil {
+				_, _, err = ws.Read(ctx)
+			}
+			assert.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
+			assert.False(t, rec.has(browser.Event{Type: browser.EventConnected}))
+			_, err = d.ListWindows(context.Background())
+			assert.ErrorIs(t, err, browser.ErrNotConnected)
+		})
 	}
-	assert.Equal(t, websocket.StatusPolicyViolation, websocket.CloseStatus(err))
-	assert.False(t, rec.has(browser.Event{Type: browser.EventConnected}))
-	_, err = d.ListWindows(context.Background())
-	assert.ErrorIs(t, err, browser.ErrNotConnected)
+}
+
+func TestDriver_CloseWindow(t *testing.T) {
+	d, srv, rec := newDriver(t)
+	var gotMethod string
+	var got map[string]any
+	startExt(t, srv, ProtocolVersion, func(method string, params json.RawMessage) (any, string) {
+		gotMethod = method
+		_ = json.Unmarshal(params, &got)
+		return map[string]any{}, ""
+	})
+	waitConnected(t, rec)
+
+	require.NoError(t, d.CloseWindow(context.Background(), "4"))
+	assert.Equal(t, "windows.remove", gotMethod)
+	assert.Equal(t, map[string]any{"windowId": float64(4)}, got)
+
+	assert.Error(t, d.CloseWindow(context.Background(), "nope"))
 }
 
 func TestDriver_DropsEventsFromReplacedConnection(t *testing.T) {
@@ -442,4 +465,44 @@ func TestWindowTitle(t *testing.T) {
 			assert.Equal(t, tc.want, NewDriver().WindowTitle(tc.window))
 		})
 	}
+}
+
+func (r *recorder) count(want browser.Event) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, ev := range r.events {
+		if ev == want {
+			n++
+		}
+	}
+	return n
+}
+
+func TestDriver_CoalescesQueuedTabsChanged(t *testing.T) {
+	d, srv, rec, gate := newBlockedDriver(t)
+	ext := startExt(t, srv, ProtocolVersion, nil)
+	waitConnected(t, rec)
+
+	ext.send(t, map[string]any{"type": "event", "event": "window.created", "data": map[string]any{"windowId": 1}})
+	require.Eventually(t, func() bool {
+		return rec.has(browser.Event{Type: browser.EventWindowCreated, WindowID: "1"})
+	}, 5*time.Second, 5*time.Millisecond)
+	for range 3 {
+		ext.send(t, map[string]any{"type": "event", "event": "tabs.changed", "data": map[string]any{"windowId": 7}})
+	}
+	ext.send(t, map[string]any{"type": "event", "event": "tabs.changed", "data": map[string]any{"windowId": 8}})
+	ext.send(t, map[string]any{"type": "event", "event": "window.removed", "data": map[string]any{"windowId": 9}})
+	require.Eventually(t, func() bool { return len(d.events) == 3 }, 5*time.Second, 5*time.Millisecond)
+	close(gate)
+
+	seven := browser.Event{Type: browser.EventTabsChanged, WindowID: "7"}
+	require.Eventually(t, func() bool {
+		return rec.has(browser.Event{Type: browser.EventWindowRemoved, WindowID: "9"})
+	}, 5*time.Second, 5*time.Millisecond)
+	assert.Equal(t, 1, rec.count(seven))
+	assert.Equal(t, 1, rec.count(browser.Event{Type: browser.EventTabsChanged, WindowID: "8"}))
+
+	ext.send(t, map[string]any{"type": "event", "event": "tabs.changed", "data": map[string]any{"windowId": 7}})
+	assert.Eventually(t, func() bool { return rec.count(seven) == 2 }, 5*time.Second, 5*time.Millisecond)
 }
