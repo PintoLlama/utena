@@ -13,12 +13,14 @@ import (
 	"github.com/eleonorayaya/utena/internal/common"
 	"github.com/eleonorayaya/utena/internal/db"
 	"github.com/eleonorayaya/utena/internal/eventbus"
+	"github.com/eleonorayaya/utena/internal/firefox"
 	"github.com/eleonorayaya/utena/internal/git"
 	"github.com/eleonorayaya/utena/internal/jobs"
 	"github.com/eleonorayaya/utena/internal/monitor"
 	"github.com/eleonorayaya/utena/internal/mux"
 	"github.com/eleonorayaya/utena/internal/session"
 	"github.com/eleonorayaya/utena/internal/tuios"
+	"github.com/eleonorayaya/utena/internal/webext"
 	"github.com/eleonorayaya/utena/internal/wm"
 	"github.com/eleonorayaya/utena/internal/workspace"
 	"github.com/go-chi/chi/v5"
@@ -67,7 +69,7 @@ func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, muxModule *mux.Module, g
 		muxModule = mux.NewModule(tuios.NewDriver(), bus, database)
 	}
 	sessionModule := session.NewSessionModule(muxModule.Service, workspaceModule, bus, database, cfg.BranchPrefix, cfg.ConfigDir, cfg.SessionsRoot)
-	browserModule := browser.NewModule(chrome.NewDriver(), browserSessions{sessions: sessionModule.Service}, newWMDriver(cfg.WM), browser.Layout{BrowserWorkspace: cfg.BrowserWorkspace, ParkWorkspace: cfg.ParkWorkspace}, bus, database)
+	browserModule := browser.NewModule(newBrowserDriver(cfg.Browser), browserSessions{sessions: sessionModule.Service}, newWMDriver(cfg.WM), browser.Layout{BrowserWorkspace: cfg.BrowserWorkspace, ParkWorkspace: cfg.ParkWorkspace}, bus, database)
 
 	jobsModule := jobs.NewJobsModule()
 	gitModule.RegisterJobs(jobsModule.Service)
@@ -90,6 +92,15 @@ func buildApp(gormDB *gorm.DB, fs afero.Fs, cfg Config, muxModule *mux.Module, g
 	database.RegisterPreMigrations(app.collectPreMigrations()...)
 
 	return app
+}
+
+var browserDrivers = map[string]func() *webext.Driver{
+	chrome.Browser.Name:  chrome.NewDriver,
+	firefox.Browser.Name: firefox.NewDriver,
+}
+
+func newBrowserDriver(name string) browser.Driver {
+	return browserDrivers[name]()
 }
 
 func newWMDriver(name string) wm.Driver {
