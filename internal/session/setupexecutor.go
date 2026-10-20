@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -391,8 +392,9 @@ func (e *setupExecution) execInstallDeps(ctx context.Context, def stepDef) error
 		pm = detectPackageManager(worktreePath)
 	}
 
+	name, args := installCommand(pm, def.RunWith)
 	return traceOp(ctx, "install_deps", func() error {
-		cmd := exec.CommandContext(ctx, pm, "install")
+		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.Dir = worktreePath
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -400,6 +402,14 @@ func (e *setupExecution) execInstallDeps(ctx context.Context, def stepDef) error
 		}
 		return nil
 	}, "pm", pm, "dir", worktreePath)
+}
+
+func installCommand(pm string, runWith []string) (string, []string) {
+	if len(runWith) == 0 {
+		return pm, []string{"install"}
+	}
+	args := append(slices.Clone(runWith[1:]), pm, "install")
+	return runWith[0], args
 }
 
 func (e *setupExecution) execApplyClaude(ctx context.Context) error {
