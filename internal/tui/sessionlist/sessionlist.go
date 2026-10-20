@@ -41,10 +41,21 @@ type Model struct {
 	browserState     browser.SessionsView
 	width            int
 	height           int
+	escQuits         bool
 }
 
-func New() Model {
-	return Model{}
+type Option func(*Model)
+
+func WithEscQuits() Option {
+	return func(m *Model) { m.escQuits = true }
+}
+
+func New(opts ...Option) Model {
+	var m Model
+	for _, opt := range opts {
+		opt(&m)
+	}
+	return m
 }
 
 func (m Model) Init() (Model, tea.Cmd) {
@@ -52,6 +63,13 @@ func (m Model) Init() (Model, tea.Cmd) {
 }
 
 func (m Model) Keys() help.KeyMap {
+	return m.keys()
+}
+
+func (m Model) keys() keyMap {
+	if m.escQuits {
+		return pickerKeys
+	}
 	return keys
 }
 
@@ -248,7 +266,7 @@ func (m Model) OnKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd, bool) {
 	}
 
 	switch {
-	case key.Matches(msg, keys.Quit):
+	case key.Matches(msg, m.keys().Quit):
 		return m, tea.Quit, true
 
 	case key.Matches(msg, keys.Up):
