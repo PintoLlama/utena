@@ -257,6 +257,9 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		if found {
 			m.picker = m.picker.Sync(m.sess.PullRequests)
 		} else {
+			gone := *m.sess
+			gone.Status = session.StatusDeleted
+			m.sess = &gone
 			m.picker = m.picker.Close()
 		}
 		if !found || m.sess.Status == session.StatusDeleted {

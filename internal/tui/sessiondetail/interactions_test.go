@@ -107,6 +107,12 @@ func TestDetail_PickerClosesWhenSessionDisappears(t *testing.T) {
 	assert.False(t, m.picker.IsOpen())
 }
 
+func TestDetail_SessionDisappearingIsTreatedAsDeleted(t *testing.T) {
+	m, _ := New().Update(SelectMsg{Session: richSession()})
+	m, _ = m.Update(provider.SessionsStateUpdatedMsg{})
+	assert.Equal(t, session.StatusDeleted, m.sess.Status)
+}
+
 func TestDetail_QuitsAfterSessionSwitch(t *testing.T) {
 	m, _ := New().Update(SelectMsg{Session: richSession()})
 	_, cmd := m.Update(provider.SessionSwitchedMsg{})
