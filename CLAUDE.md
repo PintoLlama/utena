@@ -53,6 +53,7 @@ Key commands: `task daemon:run`, `task tui:run`, `task fmt`, `task test`.
 - `internal/claude/` - Claude session management
 - `internal/bundles/` - plugin bundle catalog (`daemon.json` `"bundles"`, with plugins and MCP server names, plus `"mcp_servers"` definitions) and `GET /bundles`; sessions get plugins in `.claude/settings.local.json` and servers in `.mcp.json`
 - `internal/tui/` - Bubbletea TUI application; `internal/tui/bundlepicker` is the plugin bundle multi-select used by the new-session form and the session list's focused detail panel (`p`); `internal/tui/sessiondetail` is that panel, a child model of `internal/tui/sessionlist` that `tab` focuses; `internal/tui/provider` holds the daemon client and providers (sessions, workspaces, and a browser provider that fetches `GET /browser/sessions` after every sessions load and focuses tabs through `POST /browser/focus`)
+- `internal/diskusage/` - directory size cache for `utena top`: sizes are walked one root at a time in the background and refreshed after `max(TTL, 10× walk time)`, so `GET /sessions/resources` never blocks on disk
 - `internal/common/` - shared utilities
 
 ### Persistence
