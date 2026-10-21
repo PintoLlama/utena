@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -82,6 +83,7 @@ type SessionService struct {
 	eventBus             eventbus.EventBus
 	branchPrefix         string
 	configDir            string
+	sources              workspace.SourceReader
 	sessionsRoot         string
 	setupTimeout         time.Duration
 	bundleCatalog        bundles.Catalog
@@ -89,6 +91,7 @@ type SessionService struct {
 	claudeGlobalConfig   string
 	trustedMu            sync.Mutex
 	trustedRoots         map[string]struct{}
+	remote               RemoteBackend
 }
 
 func NewSessionService(store *SessionStore, sessionWorktreeStore *SessionWorktreeStore, dismissedPRStore *DismissedPRStore, sessionActionStore *SessionActionStore, setupStepStore *SessionSetupStepStore, workspaceService *workspace.WorkspaceService, gitService *git.GitService, muxService *mux.Service, bus eventbus.EventBus, branchPrefix string, configDir string, sessionsRoot string) *SessionService {
@@ -106,6 +109,7 @@ func NewSessionService(store *SessionStore, sessionWorktreeStore *SessionWorktre
 		eventBus:             bus,
 		branchPrefix:         branchPrefix,
 		configDir:            configDir,
+		sources:              workspace.NewLocalSourceReader(configDir),
 		sessionsRoot:         sessionsRoot,
 		setupTimeout:         defaultSetupTimeout,
 	}
@@ -114,6 +118,10 @@ func NewSessionService(store *SessionStore, sessionWorktreeStore *SessionWorktre
 func (s *SessionService) SetBundleCatalog(catalog bundles.Catalog, servers bundles.Servers) {
 	s.bundleCatalog = catalog
 	s.mcpServers = servers
+}
+
+func (s *SessionService) SetSourceReader(reader workspace.SourceReader) {
+	s.sources = reader
 }
 
 func (s *SessionService) SetClaudeGlobalConfigPath(path string) {
@@ -159,6 +167,7 @@ func (s *SessionService) OnAppStart(ctx context.Context) error {
 	s.markOrphanedSessionsBroken(sessions)
 	s.markLegacyLayoutSessionsBroken(sessions)
 	s.recoverStuckCreatingSessions(sessions)
+	s.resumeCoderDeletes(sessions)
 	s.reconcileMuxState(ctx, sessions)
 	s.syncWatchedSessionBranches(ctx, sessions)
 	return nil
@@ -191,7 +200,7 @@ func (s *SessionService) markOrphanedSessionsBroken(sessions []Session) {
 		if sess.Status == StatusDeleted || sess.Status == StatusArchived || sess.Status == StatusBroken {
 			continue
 		}
-		if len(sess.Worktrees) > 0 {
+		if len(sess.Worktrees) > 0 || sess.IsCoder() {
 			continue
 		}
 		if err := s.markSessionBroken(sess, orphanedSessionError); err != nil {
@@ -282,6 +291,10 @@ func (s *SessionService) attachPullRequests(sessions []Session) {
 	}
 	byBranch := groupPRsByBranch(s.gitService.GetPRsForBranches(branchIDs))
 	for i := range sessions {
+		if sessions[i].IsCoder() {
+			sessions[i].PullRequests = sessions[i].RemotePRs
+			continue
+		}
 		var prs []git.PullRequest
 		for _, id := range sessions[i].BranchIDs() {
 			prs = append(prs, byBranch[id]...)
@@ -326,12 +339,20 @@ func (s *SessionService) GetSession(ctx context.Context, id uint) (*Session, err
 		return nil, err
 	}
 	s.populateMuxWindows(ctx, sess)
+	if sess.IsCoder() {
+		sess.PullRequests = sess.RemotePRs
+		return sess, nil
+	}
 	sess.PullRequests = s.gitService.GetPRsForBranches(sess.BranchIDs())
 	return sess, nil
 }
 
 func (s *SessionService) IsAttached(id uint) (bool, error) {
 	return s.store.IsAttached(id)
+}
+
+func (s *SessionService) LeaderSessionID(id uint) (*uint, error) {
+	return s.store.LeaderSessionID(id)
 }
 
 func (s *SessionService) findSessionByMuxName(muxName string) (*Session, error) {
@@ -343,10 +364,12 @@ func (s *SessionService) findSessionByMuxName(muxName string) (*Session, error) 
 }
 
 type CreateSessionInput struct {
-	Name       string
-	Workspaces []WorkspaceBranchSpec
-	Actions    []*SessionAction
-	Bundles    []string
+	Name            string
+	Workspaces      []WorkspaceBranchSpec
+	Actions         []*SessionAction
+	Bundles         []string
+	LeaderSessionID *uint
+	Backend         Backend
 }
 
 type assignedSlot struct {
@@ -429,6 +452,17 @@ func (s *SessionService) CreateSession(ctx context.Context, input CreateSessionI
 		return nil, common.NewInvalidRequest(err.Error())
 	}
 
+	switch input.Backend {
+	case "", BackendLocal:
+	case BackendCoder:
+		if len(slots) != 1 {
+			return nil, common.NewInvalidRequest("coder sessions take exactly one workspace")
+		}
+		return s.createCoderSession(ctx, name, assignedSlot{spec: slots[0].spec, ws: slots[0].ws}, input)
+	default:
+		return nil, common.NewInvalidRequest(fmt.Sprintf("unknown backend %q: must be local or coder", input.Backend))
+	}
+
 	sessionRoot := filepath.Join(s.sessionsRoot, SanitizeSessionName(name))
 
 	for _, sl := range slots {
@@ -466,7 +500,10 @@ func (s *SessionService) CreateSession(ctx context.Context, input CreateSessionI
 	}
 
 	stepWS := assignedToStepWorkspaces(assigned)
-	configs := s.loadWorkspaceConfigs(stepWS)
+	configs, err := s.loadWorkspaceConfigs(ctx, stepWS)
+	if err != nil {
+		return nil, fmt.Errorf("load workspace config: %w", err)
+	}
 	sessBundles := input.Bundles
 	if sessBundles == nil {
 		sessBundles = defaultBundlesFrom(stepWS, configs)
@@ -477,11 +514,12 @@ func (s *SessionService) CreateSession(ctx context.Context, input CreateSessionI
 	}
 
 	sess := &Session{
-		Name:        name,
-		Status:      StatusCreating,
-		LastUsedAt:  time.Now(),
-		SessionRoot: sessionRoot,
-		Bundles:     bundles.Union(sessBundles),
+		Name:            name,
+		Status:          StatusCreating,
+		LastUsedAt:      time.Now(),
+		SessionRoot:     sessionRoot,
+		Bundles:         bundles.Union(sessBundles),
+		LeaderSessionID: input.LeaderSessionID,
 	}
 	if err := s.store.Add(sess); err != nil {
 		slog.WarnContext(ctx, "session create failed; session root preserved", "path", sessionRoot, "error", err)
@@ -587,6 +625,9 @@ func (s *SessionService) AddWorkspace(ctx context.Context, sessionID uint, spec 
 	if sess.Status == StatusDeleted || sess.Status == StatusArchived {
 		return nil, common.NewInvalidRequest("cannot add workspace to deleted or archived session")
 	}
+	if sess.IsCoder() {
+		return nil, ErrCoderUnsupported
+	}
 
 	ws, err := s.workspaceService.GetWorkspace(ctx, spec.WorkspaceID)
 	if err != nil {
@@ -624,6 +665,11 @@ func (s *SessionService) AddWorkspace(ctx context.Context, sessionID uint, spec 
 		branchName = s.branchPrefix + sess.Name
 	}
 
+	wsBundles, err := defaultBundles(ctx, s.sources, []workspace.Workspace{*ws})
+	if err != nil {
+		return nil, fmt.Errorf("load workspace config: %w", err)
+	}
+
 	position := len(sess.Worktrees)
 	if err := s.eagerCreateWorktree(ctx, sess.ID, ws, branchName, destPath, position); err != nil {
 		return nil, fmt.Errorf("eager create worktree: %w", err)
@@ -633,7 +679,7 @@ func (s *SessionService) AddWorkspace(ctx context.Context, sessionID uint, spec 
 		slog.WarnContext(ctx, "failed to touch workspace last-used timestamp", "workspace", ws.ID, "error", err)
 	}
 
-	if merged := bundles.Union(sess.Bundles, defaultBundles([]string{ws.Path})); len(merged) != len(sess.Bundles) {
+	if merged := bundles.Union(sess.Bundles, wsBundles); len(merged) != len(sess.Bundles) {
 		if err := s.store.UpdateBundles(sess.ID, merged); err != nil {
 			slog.WarnContext(ctx, "failed to persist session bundles", "session", sess.ID, "error", err)
 		}
@@ -674,8 +720,13 @@ func (s *SessionService) runAddWorkspace(sessionID uint, spec WorkspaceBranchSpe
 		return
 	}
 
-	orderedWS := []stepWorkspace{{ID: ws.ID, Name: ws.Name, Path: ws.Path}}
-	defs := buildWorkspaceSetupSteps(orderedWS, s.loadWorkspaceConfigs(orderedWS))
+	orderedWS := []stepWorkspace{newStepWorkspace(ws)}
+	configs, err := s.loadWorkspaceConfigs(ctx, orderedWS)
+	if err != nil {
+		markBroken("load workspace config", err)
+		return
+	}
+	defs := buildWorkspaceSetupSteps(orderedWS, configs)
 	executor := s.newSetupExecution(sess, "", defs, orderedWS,
 		map[uint]WorkspaceBranchSpec{ws.ID: spec},
 		map[uint]*workspace.Workspace{ws.ID: ws},
@@ -743,6 +794,9 @@ func (s *SessionService) SetBundles(ctx context.Context, id uint, names []string
 	if sess.Status == StatusDeleted {
 		return nil, common.NewInvalidRequest("cannot set bundles on a deleted session")
 	}
+	if sess.IsCoder() {
+		return nil, ErrCoderUnsupported
+	}
 	sess.Bundles = bundles.Union(names)
 	if err := s.store.UpdateBundles(sess.ID, sess.Bundles); err != nil {
 		return nil, fmt.Errorf("persist session bundles: %w", err)
@@ -754,15 +808,15 @@ func (s *SessionService) SetBundles(ctx context.Context, id uint, names []string
 }
 
 func (s *SessionService) DefaultBundlesFor(ctx context.Context, workspaceIDs []uint) ([]string, error) {
-	paths := make([]string, 0, len(workspaceIDs))
+	wss := make([]workspace.Workspace, 0, len(workspaceIDs))
 	for _, id := range workspaceIDs {
 		ws, err := s.workspaceService.GetWorkspace(ctx, id)
 		if err != nil {
 			return nil, err
 		}
-		paths = append(paths, ws.Path)
+		wss = append(wss, *ws)
 	}
-	return defaultBundles(paths), nil
+	return defaultBundles(ctx, s.sources, wss)
 }
 
 func (s *SessionService) writeBundles(ctx context.Context, root string, names []string) error {
@@ -930,12 +984,17 @@ func (s *SessionService) runSetup(sessionID uint, muxName string, specs []Worksp
 			markBroken("workspace lookup", err)
 			return
 		}
-		orderedWS = append(orderedWS, stepWorkspace{ID: ws.ID, Name: ws.Name, Path: ws.Path})
+		orderedWS = append(orderedWS, newStepWorkspace(ws))
 		wsByID[ws.ID] = ws
 		swtByID[ws.ID] = swt
 	}
 
-	defs := buildSetupSteps(orderedWS, s.loadWorkspaceConfigs(orderedWS))
+	configs, err := s.loadWorkspaceConfigs(ctx, orderedWS)
+	if err != nil {
+		markBroken("load workspace config", err)
+		return
+	}
+	defs := buildSetupSteps(orderedWS, configs)
 	executor := s.newSetupExecution(sess, muxName, defs, orderedWS, specByWS, wsByID, swtByID)
 	s.completeSetup(ctx, sess, executor)
 }
@@ -1125,26 +1184,79 @@ func (s *SessionService) dispatchOnCreateActions(ctx context.Context, sess *Sess
 	go executeSessionActions(actions, s.muxService, s.sessionActionStore, muxName, startDir)
 }
 
-func (s *SessionService) runScript(ctx context.Context, path string, workDir string, env []string) error {
-	info, err := os.Stat(path)
+func (s *SessionService) runWorkspaceScript(ctx context.Context, ws workspace.Workspace, workDir string, env []string) error {
+	relPath := filepath.Join(".utena", worktreeSetupName)
+	name := relPath
+	localPath := ""
+	if resolver, ok := s.sources.(workspace.LocalPathResolver); ok {
+		localPath = resolver.SourcePath(ws, relPath)
+		name = localPath
+	}
+	return s.runSourceScript(ctx, name, localPath, workDir, env, func() ([]byte, fs.FileMode, error) {
+		return s.sources.ReadSourceFile(ctx, ws, relPath)
+	})
+}
+
+func (s *SessionService) runGlobalScript(ctx context.Context, workDir string, env []string) error {
+	name := "global " + worktreeSetupName
+	localPath := ""
+	if resolver, ok := s.sources.(workspace.LocalPathResolver); ok {
+		localPath = resolver.GlobalSetupScriptPath()
+		name = localPath
+	}
+	return s.runSourceScript(ctx, name, localPath, workDir, env, func() ([]byte, fs.FileMode, error) {
+		return s.sources.ReadGlobalSetupScript(ctx)
+	})
+}
+
+func (s *SessionService) runSourceScript(ctx context.Context, name, localPath, workDir string, env []string, read func() ([]byte, fs.FileMode, error)) error {
+	data, mode, err := read()
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		return &sourceReadError{err: fmt.Errorf("read script %s: %w", name, err)}
+	}
+	if mode&0o111 == 0 {
+		return fmt.Errorf("script %s exists but is not executable", name)
+	}
+
+	path := localPath
+	if path == "" {
+		staged, err := stageScript(data, mode)
+		if err != nil {
+			return fmt.Errorf("stage script %s: %w", name, err)
 		}
-		return fmt.Errorf("failed to stat script %s: %w", path, err)
+		defer func() { _ = os.Remove(staged) }()
+		path = staged
 	}
+	return runScriptAt(ctx, name, path, workDir, env)
+}
 
-	if info.Mode()&0111 == 0 {
-		return fmt.Errorf("script %s exists but is not executable", path)
+func stageScript(data []byte, mode fs.FileMode) (string, error) {
+	f, err := os.CreateTemp("", "utena-"+worktreeSetupName+"-*")
+	if err != nil {
+		return "", err
 	}
+	path := f.Name()
+	_, writeErr := f.Write(data)
+	chmodErr := f.Chmod(mode.Perm() | 0o700)
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, chmodErr, closeErr); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
 
+func runScriptAt(ctx context.Context, name, path, workDir string, env []string) error {
 	cmd := exec.CommandContext(ctx, path)
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(), env...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("script %s failed: %s: %w", path, strings.TrimSpace(string(output)), err)
+		return fmt.Errorf("script %s failed: %s: %w", name, strings.TrimSpace(string(output)), err)
 	}
 	return nil
 }
@@ -1161,6 +1273,9 @@ func (s *SessionService) RepairSession(_ context.Context, id uint) (*Session, er
 	isWarned := sess.Status == StatusActive && sess.StatusError != ""
 	if sess.Status != StatusBroken && !isWarned {
 		return nil, ErrSessionNotBroken
+	}
+	if sess.IsCoder() {
+		return nil, ErrCoderUnsupported
 	}
 
 	if len(sess.Worktrees) == 0 {
@@ -1212,6 +1327,9 @@ func (s *SessionService) ActivateSession(ctx context.Context, id uint) (*Session
 
 	if session.Status == StatusCreating || session.Status == StatusBroken {
 		return nil, ErrCannotActivate
+	}
+	if session.IsCoder() {
+		return s.activateCoderSession(ctx, session)
 	}
 
 	s.ensureSessionWorktrees(ctx, session)
@@ -1310,6 +1428,10 @@ func (s *SessionService) DeleteSession(ctx context.Context, id uint, deleteBranc
 		if !session.CanDelete() {
 			return ErrSessionNotArchived
 		}
+	}
+
+	if session.IsCoder() {
+		return s.deleteCoderSession(ctx, session)
 	}
 
 	if deleteBranch {
@@ -1488,7 +1610,7 @@ func (s *SessionService) handleMuxSessionCreated(ctx context.Context, event even
 		return fmt.Errorf("unexpected event data type: %T", event.Data)
 	}
 
-	sess, err := s.findSessionByMuxName(data.SessionName)
+	sess, err := s.findSessionForHook(data)
 	if err != nil {
 		slog.Debug("session not found for session-created hook", "mux_name", data.SessionName, "error", err)
 		return nil
@@ -1506,7 +1628,7 @@ func (s *SessionService) handleMuxSessionClosed(ctx context.Context, event event
 		return fmt.Errorf("unexpected event data type: %T", event.Data)
 	}
 
-	sess, err := s.findSessionByMuxName(data.SessionName)
+	sess, err := s.findSessionForHook(data)
 	if err != nil {
 		slog.Debug("session not found for session-closed hook", "mux_name", data.SessionName, "error", err)
 		return nil
@@ -1536,7 +1658,7 @@ func (s *SessionService) handleMuxClientSessionChanged(ctx context.Context, even
 		}
 	}
 
-	sess, err := s.findSessionByMuxName(data.SessionName)
+	sess, err := s.findSessionForHook(data)
 	if err != nil {
 		slog.Debug("session not found for client-session-changed hook", "mux_name", data.SessionName, "error", err)
 		return nil
@@ -1557,7 +1679,7 @@ func (s *SessionService) handleMuxClientAttached(ctx context.Context, event even
 		return fmt.Errorf("unexpected event data type: %T", event.Data)
 	}
 
-	sess, err := s.findSessionByMuxName(data.SessionName)
+	sess, err := s.findSessionForHook(data)
 	if err != nil {
 		slog.Debug("session not found for client-attached hook", "mux_name", data.SessionName, "error", err)
 		return nil
@@ -1587,7 +1709,7 @@ func (s *SessionService) handleMuxClientDetached(ctx context.Context, event even
 		return fmt.Errorf("unexpected event data type: %T", event.Data)
 	}
 
-	sess, err := s.findSessionByMuxName(data.SessionName)
+	sess, err := s.findSessionForHook(data)
 	if err != nil {
 		slog.Debug("session not found for client-detached hook", "mux_name", data.SessionName, "error", err)
 		return nil
@@ -1616,6 +1738,9 @@ func (s *SessionService) ArchiveSession(ctx context.Context, id uint) (*Session,
 	}
 	if !sess.CanArchive() {
 		return nil, fmt.Errorf("cannot archive session in status %s", sess.Status)
+	}
+	if sess.IsCoder() {
+		return s.archiveCoderSession(ctx, sess)
 	}
 
 	if sess.MuxSessionID != nil {
@@ -1666,6 +1791,9 @@ func (s *SessionService) ReconcileSession(ctx context.Context, id uint) (*Sessio
 }
 
 func (s *SessionService) reconcileLoadedSession(ctx context.Context, sess *Session) (*Session, error) {
+	if sess.IsCoder() {
+		return sess, nil
+	}
 	if sess.Status == StatusCreating || sess.Status == StatusDeleted || sess.Status == StatusArchived || sess.Status == StatusPending {
 		return sess, nil
 	}

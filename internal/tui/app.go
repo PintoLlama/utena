@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -26,14 +27,43 @@ type App struct {
 	provider provider.Provider
 	router   router.Router
 	help     helpModel
+	park     func() error
 	width    int
 	height   int
 }
 
-func NewApp(port string, initialView router.View) App {
+type Option func(*options)
+
+type options struct {
+	list []sessionlist.Option
+	park func() error
+}
+
+type ParkMsg struct{}
+
+func ParkFilter(_ tea.Model, msg tea.Msg) tea.Msg {
+	if _, ok := msg.(tea.QuitMsg); ok {
+		return ParkMsg{}
+	}
+	return msg
+}
+
+func WithPark(park func() error) Option {
+	return func(o *options) { o.park = park }
+}
+
+func WithEscQuits() Option {
+	return func(o *options) { o.list = append(o.list, sessionlist.WithEscQuits()) }
+}
+
+func NewApp(port string, initialView router.View, opts ...Option) App {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	baseURL := fmt.Sprintf("http://127.0.0.1:%s", port)
 	views := map[router.View]router.ViewEntry{
-		router.SessionListView:        &router.ViewAdapter[sessionlist.Model]{Model: sessionlist.New()},
+		router.SessionListView:        &router.ViewAdapter[sessionlist.Model]{Model: sessionlist.New(o.list...)},
 		router.SessionFormView:        &router.ViewAdapter[sessionform.Model]{Model: sessionform.New()},
 		router.SessionProgressView:    &router.ViewAdapter[sessionprogress.Model]{Model: sessionprogress.New()},
 		router.WorkspaceListView:      &router.ViewAdapter[workspacelist.Model]{Model: workspacelist.New()},
@@ -46,6 +76,7 @@ func NewApp(port string, initialView router.View) App {
 		provider: provider.NewRootProvider(baseURL),
 		router:   router.New(views, initialView),
 		help:     newHelpModel(),
+		park:     o.park,
 	}
 }
 
@@ -58,8 +89,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		return a.OnWindowSizeMsg(msg)
+	case ParkMsg:
+		return a.onPark()
+	case tea.FocusMsg:
+		if a.park != nil {
+			return a, tea.Batch(provider.FetchSessions(), provider.RequestBrowserState())
+		}
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			if a.park != nil {
+				return a, tea.Interrupt
+			}
 			return a, tea.Quit
 		}
 		if a.help.full {
@@ -83,6 +123,21 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, cmd)
 
 	return a, tea.Batch(cmds...)
+}
+
+func (a App) onPark() (tea.Model, tea.Cmd) {
+	a.help = a.help.SetFull(false)
+	var cmd tea.Cmd
+	a.router, cmd = a.router.Reset(router.SessionListView)
+	park := a.park
+	return a, tea.Batch(cmd, func() tea.Msg {
+		if park != nil {
+			if err := park(); err != nil {
+				log.Printf("[ERROR] park picker: %v", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (a App) OnWindowSizeMsg(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {

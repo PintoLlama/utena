@@ -58,6 +58,13 @@ func recordingServer(t *testing.T, status int, response string) (*httptest.Serve
 	return srv, rec
 }
 
+func TestFetchSessions_SkipsDeleted(t *testing.T) {
+	srv, rec := recordingServer(t, http.StatusOK, `{"sessions":[]}`)
+	newClient(srv.URL).fetchSessions()()
+	assert.Equal(t, "/sessions", rec.path)
+	assert.Equal(t, []string{"creating,active,broken,pending,inactive,archived,completed"}, rec.query["status"])
+}
+
 func TestFetchBundles_DecodesCatalog(t *testing.T) {
 	srv, rec := recordingServer(t, http.StatusOK, `{"bundles":[{"name":"go","plugins":["go@m"]}]}`)
 	msg := newClient(srv.URL).fetchBundles()()
@@ -123,8 +130,13 @@ func TestSetSessionBundles_ErrorStatus(t *testing.T) {
 
 func createSessionBody(t *testing.T, selected []string) map[string]any {
 	t.Helper()
+	return createSessionBodyFor(t, selected, "")
+}
+
+func createSessionBodyFor(t *testing.T, selected []string, backend string) map[string]any {
+	t.Helper()
 	srv, rec := recordingServer(t, http.StatusAccepted, `{"id":3}`)
-	newClient(srv.URL).createSession("s", []SessionWorkspaceSpec{{WorkspaceID: 1}}, selected)()
+	newClient(srv.URL).createSession("s", []SessionWorkspaceSpec{{WorkspaceID: 1}}, selected, backend)()
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.body, &body))
 	return body
@@ -153,4 +165,23 @@ func TestSessionsProvider_SessionBundlesSetRefetchesSessions(t *testing.T) {
 	require.NotNil(t, cmd)
 	uitest.Drain(cmd)
 	assert.Equal(t, "/sessions", rec.path)
+}
+
+func TestCreateSession_OmitsBackendForLocal(t *testing.T) {
+	body := createSessionBodyFor(t, nil, "")
+	_, present := body["backend"]
+	assert.False(t, present)
+}
+
+func TestCreateSession_SendsCoderBackend(t *testing.T) {
+	body := createSessionBodyFor(t, nil, "coder")
+	assert.Equal(t, "coder", body["backend"])
+}
+
+func TestFetchCoderStatus(t *testing.T) {
+	srv, _ := recordingServer(t, http.StatusOK, `{"configured":true,"connections":[]}`)
+	assert.Equal(t, CoderStatusLoadedMsg{Configured: true}, newClient(srv.URL).fetchCoderStatus()())
+
+	srv, _ = recordingServer(t, http.StatusNotFound, `{}`)
+	assert.Equal(t, CoderStatusLoadedMsg{}, newClient(srv.URL).fetchCoderStatus()())
 }

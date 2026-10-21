@@ -5,10 +5,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/eleonorayaya/utena/internal/bundles"
+	"github.com/eleonorayaya/utena/internal/coder"
 )
 
 type Config struct {
@@ -21,8 +25,11 @@ type Config struct {
 	Browser          string
 	BrowserWorkspace string
 	ParkWorkspace    string
+	Follower         bool
+	LeaderURL        string
 	Bundles          bundles.Catalog
 	McpServers       bundles.Servers
+	Coder            coder.Config
 }
 
 func LoadConfig(args []string) (Config, error) {
@@ -45,6 +52,8 @@ func LoadConfig(args []string) (Config, error) {
 	fs.StringVar(&cfg.Browser, "browser", "chrome", "browser driver: chrome, firefox or chrome-applescript")
 	fs.StringVar(&cfg.BrowserWorkspace, "browser-workspace", "2", "workspace for the attached session's browser windows")
 	fs.StringVar(&cfg.ParkWorkspace, "park-workspace", "P", "workspace for other sessions' browser windows")
+	fs.BoolVar(&cfg.Follower, "follower", false, "run as a follower of a leader daemon: source files and browser opens go to the leader")
+	fs.StringVar(&cfg.LeaderURL, "leader-url", "", "base URL of the leader daemon, required with --follower")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -92,6 +101,31 @@ func LoadConfig(args []string) (Config, error) {
 		cfg.ParkWorkspace = v
 	}
 
+	if v := os.Getenv("UTENA_FOLLOWER"); v != "" {
+		follower, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid UTENA_FOLLOWER %q: %w", v, err)
+		}
+		cfg.Follower = follower
+	}
+	if v := os.Getenv("UTENA_LEADER_URL"); v != "" {
+		cfg.LeaderURL = v
+	}
+	cfg.LeaderURL = strings.TrimRight(cfg.LeaderURL, "/")
+
+	if cfg.Follower {
+		if cfg.LeaderURL == "" {
+			return Config{}, errors.New("--follower requires --leader-url (or UTENA_LEADER_URL)")
+		}
+		u, err := url.Parse(cfg.LeaderURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return Config{}, fmt.Errorf("invalid leader URL %q: must be absolute, e.g. http://127.0.0.1:3334", cfg.LeaderURL)
+		}
+	}
+	cfg.Coder, err = coder.ParseConfig(file.Coder, cfg.Port)
+	if err != nil {
+		return Config{}, err
+	}
 	if _, ok := browserDrivers[cfg.Browser]; !ok {
 		return Config{}, fmt.Errorf("invalid browser %q: must be chrome, firefox or chrome-applescript", cfg.Browser)
 	}
@@ -103,9 +137,10 @@ func LoadConfig(args []string) (Config, error) {
 }
 
 type daemonFile struct {
-	Browser    string          `json:"browser"`
-	Bundles    bundles.Catalog `json:"bundles"`
-	McpServers bundles.Servers `json:"mcp_servers"`
+	Browser    string           `json:"browser"`
+	Bundles    bundles.Catalog  `json:"bundles"`
+	McpServers bundles.Servers  `json:"mcp_servers"`
+	Coder      coder.FileConfig `json:"coder"`
 }
 
 func loadDaemonFile(dir string) (daemonFile, error) {

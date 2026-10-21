@@ -30,6 +30,13 @@ const (
 	fieldCount
 )
 
+const fieldBackend = fieldCount
+
+const (
+	backendLocal = "local"
+	backendCoder = "coder"
+)
+
 type overlay int
 
 const (
@@ -53,15 +60,22 @@ type Model struct {
 	rowCursor       int
 	pickingRow      int
 	mode            ui.Choice
+	backend         ui.Choice
+	coderAvailable  bool
 	name            textinput.Model
 	nameErr         string
 	workspacesErr   string
 	status          ui.Status
 	submitting      bool
+	submitted       string
 	width, height   int
 }
 
-var labels = [fieldCount]string{"Workspaces", "Bundles", "Branches", "Mode", "Name"}
+var labels = [fieldCount + 1]string{"Workspaces", "Bundles", "Branches", "Mode", "Name", "Backend"}
+
+func newBackendChoice() ui.Choice {
+	return ui.Choice{Options: []string{backendLocal, backendCoder}}
+}
 
 func New() Model {
 	return Model{
@@ -71,15 +85,24 @@ func New() Model {
 		bundlePicker:    bundlepicker.New("Bundles"),
 		filePicker:      filepicker.New(),
 		mode:            branchfield.NewModeChoice(),
+		backend:         newBackendChoice(),
 		name:            ui.NewInput(""),
 	}
 }
 
+func (m Model) fieldTotal() int {
+	if m.coderAvailable {
+		return fieldCount + 1
+	}
+	return fieldCount
+}
+
 func (m Model) Init() (Model, tea.Cmd) {
-	m.form = m.form.Focus(fieldName)
+	m.form = ui.NewForm("New session", m.fieldTotal()).Focus(fieldName)
 	m.rows = nil
 	m.rowCursor = 0
 	m.mode = branchfield.NewModeChoice()
+	m.backend = newBackendChoice()
 	m.name = ui.NewInput("")
 	m.name.Width = ui.InputWidth(m.width, labels[:]...)
 	m.nameErr = ""
@@ -90,7 +113,7 @@ func (m Model) Init() (Model, tea.Cmd) {
 	m.selectedBundles = nil
 	m.overlay = overlayWorkspaces
 	m.workspacePicker = m.workspacePicker.Open(nil)
-	return m, tea.Batch(provider.FetchWorkspaces(), provider.RequestWorkspacesState(), provider.FetchBundles())
+	return m, tea.Batch(provider.FetchWorkspaces(), provider.RequestWorkspacesState(), provider.FetchBundles(), provider.FetchCoderStatus())
 }
 
 func (m *Model) SetSize(width, height int) {
@@ -114,7 +137,7 @@ func (m Model) Keys() help.KeyMap {
 		return m.bundlePicker.Keys()
 	}
 	k := formKeys
-	onName := m.form.Focused() == fieldName
+	onName := m.form.Focused() == fieldName || m.form.Focused() == fieldBackend
 	k.Create.SetEnabled(onName)
 	k.Edit.SetEnabled(!onName)
 	return k
@@ -192,6 +215,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.rows[i] = m.rows[i].Checked(msg)
 		}
 		return m, nil
+	case provider.CoderStatusLoadedMsg:
+		available := msg.Err == nil && msg.Configured
+		if available != m.coderAvailable {
+			m.coderAvailable = available
+			m.form = ui.NewForm("New session", m.fieldTotal()).Focus(m.form.Focused())
+			if !available {
+				m.backend = newBackendChoice()
+			}
+		}
+		return m, nil
 	case provider.BundlesLoadedMsg:
 		if msg.Err == nil {
 			m.bundlePicker = m.bundlePicker.SetCatalog(msg.Bundles)
@@ -211,6 +244,9 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		return m, nil
 	case provider.SessionCreatedMsg:
 		m.submitting = false
+		if m.submitted == backendCoder {
+			return m, router.Back()
+		}
 		return m, tea.Sequence(router.NavigateTo(router.SessionProgressView), sessionprogress.Start(msg.ID))
 	}
 
@@ -416,7 +452,7 @@ func (m Model) onPageKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 		case fieldMode:
 			m.mode, _ = m.mode.Update(tea.KeyMsg{Type: tea.KeySpace})
 			return m, nil
-		case fieldName:
+		case fieldName, fieldBackend:
 			return m.submit()
 		}
 	}
@@ -424,6 +460,9 @@ func (m Model) onPageKey(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch field {
 	case fieldMode:
 		m.mode, _ = m.mode.Update(msg)
+		return m, nil
+	case fieldBackend:
+		m.backend, _ = m.backend.Update(msg)
 		return m, nil
 	case fieldName:
 		var cmd tea.Cmd
@@ -462,7 +501,15 @@ func (m Model) submit() (Model, tea.Cmd) {
 	m.nameErr = ""
 	m.status = ui.Status{}
 	m.submitting = true
-	return m, provider.CreateSession(name, buildSpecs(m.rows, isNew), m.selectedBundles)
+	m.submitted = m.selectedBackend()
+	return m, provider.CreateSession(name, buildSpecs(m.rows, isNew), m.selectedBundles, m.submitted)
+}
+
+func (m Model) selectedBackend() string {
+	if m.coderAvailable && m.backend.Value() == backendCoder {
+		return backendCoder
+	}
+	return ""
 }
 
 func buildSpecs(rows []branchfield.Row, isNew bool) []provider.SessionWorkspaceSpec {
@@ -502,13 +549,17 @@ func (m Model) fields() []ui.Field {
 		nameHint = "optional — derived from the branch when empty"
 	}
 
-	return []ui.Field{
+	fields := []ui.Field{
 		{Label: labels[fieldWorkspaces], Value: wsValue, Error: m.workspacesErr},
 		{Label: labels[fieldBundles], Value: bundlesValue, Hint: bundlesHint},
 		{Label: labels[fieldBranches], Value: branches},
 		{Label: labels[fieldMode], Value: m.mode.View(focused == fieldMode)},
 		{Label: labels[fieldName], Value: m.name.View(), Error: m.nameErr, Hint: nameHint},
 	}
+	if m.coderAvailable {
+		fields = append(fields, ui.Field{Label: labels[fieldBackend], Value: m.backend.View(focused == fieldBackend), Hint: "coder runs the session in a new Coder workspace"})
+	}
+	return fields
 }
 
 func (m Model) bundles() []string {

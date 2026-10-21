@@ -109,9 +109,11 @@ func (c *SessionController) CreateSession(w http.ResponseWriter, r *http.Request
 	}
 
 	session, err := c.service.CreateSession(ctx, CreateSessionInput{
-		Name:       data.Name,
-		Workspaces: data.Workspaces,
-		Bundles:    data.Bundles,
+		Name:            data.Name,
+		Workspaces:      data.Workspaces,
+		Bundles:         data.Bundles,
+		LeaderSessionID: data.LeaderSessionID,
+		Backend:         data.Backend,
 	})
 	if err != nil {
 		common.RenderError(w, r, err)

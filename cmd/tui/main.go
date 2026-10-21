@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
+	"github.com/eleonorayaya/utena/internal/aerospace"
+	"github.com/eleonorayaya/utena/internal/picker"
 	"github.com/eleonorayaya/utena/internal/shellinit"
 	"github.com/eleonorayaya/utena/internal/tui"
 	"github.com/eleonorayaya/utena/internal/tui/router"
@@ -22,6 +27,7 @@ var (
 )
 
 func main() {
+	disableResponseCompression()
 	os.Args = rewriteArgs(os.Args)
 	rootCmd := &cobra.Command{
 		Use:          "utena",
@@ -41,10 +47,15 @@ func main() {
 	rootCmd.AddCommand(hookCmd())
 	rootCmd.AddCommand(topCmd())
 	rootCmd.AddCommand(openCmd())
+	rootCmd.AddCommand(pickerCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func disableResponseCompression() {
+	http.DefaultTransport.(*http.Transport).DisableCompression = true
 }
 
 func setupLogging() {
@@ -76,10 +87,37 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	setupLogging()
 	loadTheme()
 
-	p := tea.NewProgram(tui.NewApp(port, router.SessionListView))
+	p := tea.NewProgram(tui.NewApp(port, router.SessionListView, appOptions(os.Getenv)...), programOptions(os.Getenv)...)
 	_, err := p.Run()
+	if errors.Is(err, tea.ErrInterrupted) {
+		err = nil
+	}
 	closeOwnPopup()
+	returnPickerFocus(aerospace.NewDriver(), os.Getenv)
 	return err
+}
+
+func appOptions(getenv func(string) string) []tui.Option {
+	if getenv(picker.EnvPicker) == "" {
+		return nil
+	}
+	opts := []tui.Option{tui.WithEscQuits()}
+	if workspace := getenv(picker.EnvPark); workspace != "" {
+		title := getenv(picker.EnvTitle)
+		opts = append(opts, tui.WithPark(func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), wmTimeout)
+			defer cancel()
+			return picker.Park(ctx, aerospace.NewDriver(), title, workspace, picker.DefaultReturnPath())
+		}))
+	}
+	return opts
+}
+
+func programOptions(getenv func(string) string) []tea.ProgramOption {
+	if getenv(picker.EnvPicker) == "" || getenv(picker.EnvPark) == "" {
+		return nil
+	}
+	return []tea.ProgramOption{tea.WithFilter(tui.ParkFilter), tea.WithReportFocus()}
 }
 
 func closeOwnPopup() {
