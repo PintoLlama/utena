@@ -21,9 +21,11 @@ import (
 
 const browserAlias = "utena-open"
 
-// fallbackEnvVar marks a process started by systemOpen. xdg-open hands URLs to
-// $BROWSER, which is utena-open, so without the guard a daemon that answers
-// 503 makes every fallback spawn another utena-open, forever (2026-10-21).
+// fallbackEnvVar carries the pid of the utena-open running systemOpen. xdg-open
+// hands URLs to $BROWSER, which is utena-open, so without the guard a daemon
+// that answers 503 makes every fallback spawn another utena-open, forever
+// (2026-10-21). The guard only holds while that pid is an ancestor, so programs
+// the fallback starts (a new Chrome, say) do not inherit a dead guard.
 const fallbackEnvVar = "UTENA_OPEN_FALLBACK"
 
 func openCmd() *cobra.Command {
@@ -60,12 +62,37 @@ func openURL(ctx context.Context, out io.Writer, baseURL string, sessionID uint,
 }
 
 func systemOpen(url string) error {
-	if os.Getenv(fallbackEnvVar) != "" {
+	if insideFallback(os.Getenv(fallbackEnvVar), os.Getppid(), parentPID) {
 		return fmt.Errorf("utena: browser unavailable and already inside the system opener, not opening %s", url)
 	}
 	cmd := exec.Command("/usr/bin/open", url)
-	cmd.Env = fallbackEnv(os.Environ(), userManagerEnv())
+	cmd.Env = fallbackEnv(os.Environ(), userManagerEnv(), os.Getpid())
 	return cmd.Run()
+}
+
+func insideFallback(guard string, ppid int, parent func(int) int) bool {
+	pid, err := strconv.Atoi(guard)
+	if err != nil || pid <= 1 {
+		return false
+	}
+	for i, p := 0, ppid; i < 64 && p > 1; i, p = i+1, parent(p) {
+		if p == pid {
+			return true
+		}
+	}
+	return false
+}
+
+func parentPID(pid int) int {
+	out, err := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0
+	}
+	ppid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0
+	}
+	return ppid
 }
 
 // desktopEnvVars are what xdg-open needs to reach the desktop's browser. tuios
@@ -73,7 +100,7 @@ func systemOpen(url string) error {
 // text browser, so they are filled in from the systemd user manager.
 var desktopEnvVars = []string{"DISPLAY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"}
 
-func fallbackEnv(env, session []string) []string {
+func fallbackEnv(env, session []string, pid int) []string {
 	out := make([]string, 0, len(env)+len(desktopEnvVars)+1)
 	have := map[string]bool{}
 	for _, kv := range env {
@@ -90,7 +117,7 @@ func fallbackEnv(env, session []string) []string {
 			out = append(out, kv)
 		}
 	}
-	return append(out, fallbackEnvVar+"=1")
+	return append(out, fallbackEnvVar+"="+strconv.Itoa(pid))
 }
 
 func userManagerEnv() []string {
