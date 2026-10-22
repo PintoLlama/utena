@@ -21,11 +21,6 @@ import (
 
 const browserAlias = "utena-open"
 
-// fallbackEnvVar carries the pid of the utena-open running systemOpen. xdg-open
-// hands URLs to $BROWSER, which is utena-open, so without the guard a daemon
-// that answers 503 makes every fallback spawn another utena-open, forever
-// (2026-10-21). The guard only holds while that pid is an ancestor, so programs
-// the fallback starts (a new Chrome, say) do not inherit a dead guard.
 const fallbackEnvVar = "UTENA_OPEN_FALLBACK"
 
 func openCmd() *cobra.Command {
@@ -95,9 +90,6 @@ func parentPID(pid int) int {
 	return ppid
 }
 
-// desktopEnvVars are what xdg-open needs to reach the desktop's browser. tuios
-// panes run without them, and xdg-open would then fall back to $BROWSER or a
-// text browser, so they are filled in from the systemd user manager.
 var desktopEnvVars = []string{"DISPLAY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"}
 
 func fallbackEnv(env, session []string, pid int) []string {

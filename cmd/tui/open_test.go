@@ -98,7 +98,6 @@ func TestSystemOpenRefusesToRecurse(t *testing.T) {
 }
 
 func TestInsideFallback(t *testing.T) {
-	// 50 -> 40 -> 30 -> 1
 	parents := map[int]int{50: 40, 40: 30, 30: 1}
 	parent := func(p int) int { return parents[p] }
 
